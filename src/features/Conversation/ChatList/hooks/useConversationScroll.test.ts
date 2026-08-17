@@ -64,6 +64,7 @@ describe('useConversationScroll — helpers', () => {
       getConversationSpacerScrollEffect({
         delta: -24,
         hasPrevOffset: true,
+        hasUserIntent: true,
         isAIGenerating: true,
         isMounted: true,
       }),
@@ -75,6 +76,7 @@ describe('useConversationScroll — helpers', () => {
       getConversationSpacerScrollEffect({
         delta: -24,
         hasPrevOffset: true,
+        hasUserIntent: true,
         isAIGenerating: false,
         isMounted: true,
       }),
@@ -86,6 +88,19 @@ describe('useConversationScroll — helpers', () => {
       getConversationSpacerScrollEffect({
         delta: -999,
         hasPrevOffset: false,
+        hasUserIntent: true,
+        isAIGenerating: false,
+        isMounted: true,
+      }),
+    ).toEqual({ cancelPin: false, shrinkSpacer: false });
+  });
+
+  it('ignores layout-driven negative offsets without user scroll intent', () => {
+    expect(
+      getConversationSpacerScrollEffect({
+        delta: -24,
+        hasPrevOffset: true,
+        hasUserIntent: false,
         isAIGenerating: false,
         isMounted: true,
       }),
@@ -141,7 +156,9 @@ describe('useConversationScroll — pin behavior', () => {
   };
 
   const renderScrollHook = (props: {
+    contextKey?: string;
     dataSource: string[];
+    headerOffset?: number;
     isSecondLastMessageFromUser: boolean;
     fixture?: Partial<StoreFixture>;
   }) => {
@@ -157,22 +174,33 @@ describe('useConversationScroll — pin behavior', () => {
     installStoreMock();
 
     const hook = renderHook(
-      ({ dataSource, isSecondLastMessageFromUser }) =>
-        useConversationScroll({ dataSource, isSecondLastMessageFromUser, virtuaRef }),
+      ({ contextKey, dataSource, isSecondLastMessageFromUser }) =>
+        useConversationScroll({
+          contextKey,
+          dataSource,
+          headerOffset: props.headerOffset,
+          isSecondLastMessageFromUser,
+          virtuaRef,
+        }),
       {
         initialProps: {
+          contextKey: props.contextKey,
           dataSource: props.dataSource,
           isSecondLastMessageFromUser: props.isSecondLastMessageFromUser,
         },
       },
     );
 
-    const rerender = (next: { dataSource: string[]; isSecondLastMessageFromUser: boolean }) => {
+    const rerender = (next: {
+      contextKey?: string;
+      dataSource: string[];
+      isSecondLastMessageFromUser: boolean;
+    }) => {
       currentFixture = {
         ...currentFixture,
         displayMessages: deriveDisplayMessages(next.isSecondLastMessageFromUser),
       };
-      hook.rerender(next);
+      hook.rerender({ contextKey: undefined, ...next });
     };
 
     return { ...hook, rerender };
@@ -205,6 +233,23 @@ describe('useConversationScroll — pin behavior', () => {
 
     expect(scrollToIndex).toHaveBeenCalledTimes(1);
     expect(scrollToIndex).toHaveBeenCalledWith(2, { align: 'start', smooth: true });
+  });
+
+  it('translates the pin target by headerOffset when a header slot row is present', () => {
+    const { rerender } = renderScrollHook({
+      dataSource: [assistantId, 'prev'],
+      headerOffset: 1,
+      isSecondLastMessageFromUser: false,
+    });
+
+    rerender({
+      dataSource: ['m0', 'm1', userId, assistantId],
+      isSecondLastMessageFromUser: true,
+    });
+
+    // User message index 2 sits at virtua row 3 (header row 0 + messages).
+    expect(scrollToIndex).toHaveBeenCalledTimes(1);
+    expect(scrollToIndex).toHaveBeenCalledWith(3, { align: 'start', smooth: true });
   });
 
   it('does not scroll when only the assistant message is appended', () => {
@@ -252,6 +297,58 @@ describe('useConversationScroll — pin behavior', () => {
     expect(scrollToIndex).not.toHaveBeenCalled();
   });
 
+  it('does not treat a topic switch as a send even when the length delta is +2', () => {
+    const { rerender } = renderScrollHook({
+      contextKey: 'main_agt_1_tpc_a',
+      dataSource: [assistantId, 'prev'],
+      isSecondLastMessageFromUser: false,
+    });
+
+    rerender({
+      contextKey: 'main_agt_1_tpc_b',
+      dataSource: ['m0', 'm1', userId, assistantId],
+      isSecondLastMessageFromUser: true,
+    });
+
+    expect(scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it('deactivates a live spacer when the context switches', async () => {
+    const { result, rerender } = renderScrollHook({
+      contextKey: 'main_agt_1_tpc_a',
+      dataSource: [assistantId, 'prev'],
+      isSecondLastMessageFromUser: false,
+      fixture: {
+        virtuaScrollMethods: {
+          getItemOffset: (i: number) => i * 100,
+          getItemSize: () => 80,
+          getScrollOffset: () => 0,
+          getViewportSize: () => 800,
+        },
+      },
+    });
+
+    rerender({
+      contextKey: 'main_agt_1_tpc_a',
+      dataSource: ['m0', 'm1', userId, assistantId],
+      isSecondLastMessageFromUser: true,
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    expect(result.current.spacerActive).toBe(true);
+
+    rerender({
+      contextKey: 'main_agt_1_tpc_b',
+      dataSource: ['x0', 'x1', 'x2'],
+      isSecondLastMessageFromUser: false,
+    });
+
+    expect(result.current.spacerActive).toBe(false);
+    expect(result.current.listData).toEqual(['x0', 'x1', 'x2']);
+  });
+
   it('does not throw or scroll when virtuaRef is not ready at send time', () => {
     virtuaRef.current = null;
 
@@ -288,7 +385,7 @@ describe('useConversationScroll — pin behavior', () => {
       // simulate viewport mount via prev offset seeding: first call seeds prev=0
       result.current.onScrollOffset(0);
       // then user scrolls up (negative delta)
-      result.current.onScrollOffset(-50);
+      result.current.onScrollOffset(-50, true);
     });
 
     // Simulate a later layout bump that would have re-fired a scroll before.
@@ -301,6 +398,32 @@ describe('useConversationScroll — pin behavior', () => {
     });
 
     expect(scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  // Regression: settle re-pins fire while the content height is still changing
+  // (e.g. a workflow collapse at turn completion). A smooth scroll there is
+  // itself a visible slide, so only the initial send scroll may animate.
+  it('re-pins without smooth scrolling once the spacer layout settles', () => {
+    const { result, rerender } = renderScrollHook({
+      dataSource: [assistantId, 'prev'],
+      isSecondLastMessageFromUser: false,
+    });
+
+    rerender({
+      dataSource: ['m0', 'm1', userId, assistantId],
+      isSecondLastMessageFromUser: true,
+    });
+    expect(scrollToIndex).toHaveBeenCalledWith(2, { align: 'start', smooth: true });
+    scrollToIndex.mockClear();
+
+    // Registering the spacer node bumps spacerLayoutVersion, which is the
+    // "layout settled" beat the pin controller retries on.
+    const spacerNode = document.createElement('div');
+    act(() => {
+      result.current.registerSpacerNode(spacerNode);
+    });
+
+    expect(scrollToIndex).toHaveBeenCalledWith(2, { align: 'start', smooth: false });
   });
 
   it('does not scroll on initial render', () => {

@@ -1,6 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 
-import type { Command } from 'commander';
+import { ReasoningGraphSchema } from '@lobechat/types';
+import { type Command, InvalidArgumentError } from 'commander';
 import pc from 'picocolors';
 
 import { getTrpcClient } from '../api/client';
@@ -14,33 +15,43 @@ import {
 import { resolveLocalDeviceId } from '../utils/device';
 import { confirm, outputJson, printTable, truncate } from '../utils/format';
 import { log, setVerbose } from '../utils/logger';
+import { resolveAgentId } from './agent/resolveAgentId';
+import { registerAgentSpaceFsCommand } from './agent/spaceFs';
 
-/**
- * Resolve an agent identifier (agentId or slug) to a concrete agentId.
- * When a slug is provided, uses getBuiltinAgent to look up the agent.
- */
-async function resolveAgentId(
-  client: any,
-  opts: { agentId?: string; slug?: string },
-): Promise<string> {
-  if (opts.agentId) return opts.agentId;
+const readGraphConfig = async (graphFile: string): Promise<unknown> => {
+  const content = await readFile(graphFile, 'utf8');
+  const graph = JSON.parse(content);
+  const result = ReasoningGraphSchema.safeParse(graph);
 
-  if (opts.slug) {
-    const agent = await client.agent.getBuiltinAgent.query({ slug: opts.slug });
-    if (!agent) {
-      log.error(`Agent not found for slug: ${opts.slug}`);
-      process.exit(1);
-    }
-    return (agent as any).id || (agent as any).agentId;
+  if (!result.success) {
+    const issue = result.error.issues[0];
+    const path = issue?.path.length ? `${issue.path.join('.')}: ` : '';
+    throw new Error(`Invalid ReasoningGraph: ${path}${issue?.message ?? 'unknown error'}`);
   }
 
-  log.error('Either <agentId> or --slug is required.');
-  process.exit(1);
-  return ''; // unreachable
-}
+  return result.data;
+};
+
+const readJsonObjectFile = async (
+  filePath: string,
+  label: string,
+): Promise<Record<string, unknown>> => {
+  const content = await readFile(filePath, 'utf8');
+  const parsed = JSON.parse(content);
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`${label} JSON must be a plain object`);
+  }
+
+  return parsed as Record<string, unknown>;
+};
+
+const readAgencyConfig = (agencyConfigFile: string): Promise<Record<string, unknown>> =>
+  readJsonObjectFile(agencyConfigFile, 'agencyConfig');
 
 export function registerAgentCommand(program: Command) {
   const agent = program.command('agent').description('Manage agents');
+  registerAgentSpaceFsCommand(agent);
 
   // ── list ──────────────────────────────────────────────
 
@@ -175,11 +186,29 @@ export function registerAgentCommand(program: Command) {
     .option('-m, --model <model>', 'New model ID')
     .option('-p, --provider <provider>', 'New provider ID')
     .option('-s, --system-role <role>', 'New system role prompt')
+    .option('--graph-file <path>', 'ReasoningGraph JSON file')
+    .option('--enable-graph', 'Enable graph runtime')
+    .option('--disable-graph', 'Disable graph runtime')
+    .option(
+      '--agency-config-file <path>',
+      'agencyConfig JSON file, deep-merged into the agent (send `null` to clear a nested key)',
+    )
+    .option(
+      '--config-file <path>',
+      'Agent config JSON file for fields without a dedicated flag (openingMessage, openingQuestions, tags, avatar, params, chatConfig, …). Deep-merged server-side; identity fields (id/slug/userId/workspaceId/visibility) are rejected. Explicit flags win over this file.',
+    )
+    .option('--json [fields]', 'Output the updated agent as JSON, optionally selecting fields')
     .action(
       async (
         agentIdArg: string | undefined,
         options: {
+          agencyConfigFile?: string;
+          configFile?: string;
           description?: string;
+          disableGraph?: boolean;
+          enableGraph?: boolean;
+          graphFile?: string;
+          json?: string | boolean;
           model?: string;
           provider?: string;
           slug?: string;
@@ -188,22 +217,79 @@ export function registerAgentCommand(program: Command) {
         },
       ) => {
         const value: Record<string, any> = {};
+
+        // Read first so the explicit flags below overwrite it — the file is the
+        // broad brush, the flags are the precise correction.
+        if (options.configFile) {
+          try {
+            Object.assign(value, await readJsonObjectFile(options.configFile, 'agent config'));
+          } catch (error) {
+            log.error(`Failed to read agent config JSON: ${(error as Error).message}`);
+            process.exit(1);
+            return;
+          }
+        }
+
         if (options.title) value.title = options.title;
         if (options.description) value.description = options.description;
         if (options.model) value.model = options.model;
         if (options.provider) value.provider = options.provider;
         if (options.systemRole) value.systemRole = options.systemRole;
 
+        if (options.enableGraph && options.disableGraph) {
+          log.error('Use either --enable-graph or --disable-graph, not both.');
+          process.exit(1);
+          return;
+        }
+
+        const chatConfig: Record<string, any> = {};
+        if (options.enableGraph) chatConfig.enableGraphMode = true;
+        if (options.disableGraph) chatConfig.enableGraphMode = false;
+        if (options.graphFile) {
+          try {
+            chatConfig.graph = await readGraphConfig(options.graphFile);
+          } catch (error) {
+            log.error(`Failed to read graph JSON: ${(error as Error).message}`);
+            process.exit(1);
+            return;
+          }
+        }
+        // Merged, not replaced: `--config-file` may carry other chatConfig keys
+        // and the graph flags should only override the ones they own.
+        if (Object.keys(chatConfig).length > 0) {
+          value.chatConfig = { ...(value.chatConfig as object | undefined), ...chatConfig };
+        }
+
+        // agencyConfig is deep-merged server-side, so a nested key is removed by
+        // sending it as `null` (e.g. `{ "heterogeneousProvider": null }`); omitted keys are kept.
+        if (options.agencyConfigFile) {
+          try {
+            value.agencyConfig = await readAgencyConfig(options.agencyConfigFile);
+          } catch (error) {
+            log.error(`Failed to read agencyConfig JSON: ${(error as Error).message}`);
+            process.exit(1);
+            return;
+          }
+        }
+
         if (Object.keys(value).length === 0) {
           log.error(
-            'No changes specified. Use --title, --description, --model, --provider, or --system-role.',
+            'No changes specified. Use --title, --description, --model, --provider, --system-role, --graph-file, --enable-graph, --disable-graph, --agency-config-file, or --config-file.',
           );
           process.exit(1);
+          return;
         }
 
         const client = await getTrpcClient();
         const agentId = await resolveAgentId(client, { agentId: agentIdArg, slug: options.slug });
-        await client.agent.updateAgentConfig.mutate({ agentId, value });
+        const result: any = await client.agent.updateAgentConfig.mutate({ agentId, value });
+
+        if (options.json !== undefined) {
+          const fields = typeof options.json === 'string' ? options.json : undefined;
+          outputJson(result?.agent ?? result, fields);
+          return;
+        }
+
         console.log(`${pc.green('✓')} Updated agent ${pc.bold(agentId)}`);
       },
     );
@@ -339,7 +425,7 @@ export function registerAgentCommand(program: Command) {
         }
 
         // 1. Exec agent to get operationId
-        const input: Record<string, any> = { prompt: options.prompt };
+        const input: Record<string, any> = { prompt: options.prompt, trigger: 'cli' };
         if (options.agentId) input.agentId = options.agentId;
         if (deviceId) input.deviceId = deviceId;
         if (options.slug) input.slug = options.slug;
@@ -368,22 +454,33 @@ export function registerAgentCommand(program: Command) {
         const { serverUrl, headers, token, tokenType } = await getAgentStreamAuthInfo();
         const agentGatewayUrl = options.sse ? undefined : resolveAgentGatewayUrl();
 
-        if (agentGatewayUrl) {
-          await streamAgentEventsViaWebSocket({
-            gatewayUrl: agentGatewayUrl,
-            json: options.json,
-            operationId,
-            serverUrl,
-            token,
-            tokenType,
-            verbose: options.verbose,
-          });
-        } else {
-          const streamUrl = `${serverUrl}/api/agent/stream?operationId=${encodeURIComponent(operationId)}`;
-          await streamAgentEvents(streamUrl, headers, {
-            json: options.json,
-            verbose: options.verbose,
-          });
+        try {
+          if (agentGatewayUrl) {
+            await streamAgentEventsViaWebSocket({
+              gatewayUrl: agentGatewayUrl,
+              json: options.json,
+              operationId,
+              serverUrl,
+              token,
+              tokenType,
+              verbose: options.verbose,
+            });
+          } else {
+            const streamUrl = `${serverUrl}/api/agent/stream?operationId=${encodeURIComponent(operationId)}`;
+            await streamAgentEvents(streamUrl, headers, {
+              json: options.json,
+              verbose: options.verbose,
+            });
+          }
+        } catch (error) {
+          // The live stream (gateway WS / SSE) dropped before the run finished —
+          // the run is still executing server-side. Instead of failing, fall back
+          // to polling the run status until it reaches a terminal state.
+          if (options.json) throw error;
+          log.warn(
+            `Live stream unavailable (${(error as Error).message}). Polling run status every 10s…`,
+          );
+          await pollAgentRunStatus(client, operationId);
         }
       },
     );
@@ -626,6 +723,53 @@ export function registerAgentCommand(program: Command) {
         if (r.completedAt) console.log(`  Ended:   ${r.completedAt}`);
       },
     );
+
+  // ── interrupt ──────────────────────────────────────────
+
+  // Mirrors the server's InterruptTaskSchema: all three ids are optional, but
+  // at least one of operationId / threadId must be provided.
+  agent
+    .command('interrupt')
+    .description('Interrupt a running agent operation')
+    .option('--operation-id <id>', 'Operation ID to interrupt')
+    .option('--thread-id <id>', 'Thread ID (resolves the operation from thread metadata)')
+    .option('--topic-id <id>', 'Topic ID (enables remote device cancellation when applicable)')
+    .option('--json', 'Output JSON envelope')
+    .action(
+      async (options: {
+        json?: boolean;
+        operationId?: string;
+        threadId?: string;
+        topicId?: string;
+      }) => {
+        if (!options.operationId && !options.threadId) {
+          throw new InvalidArgumentError('Either --thread-id or --operation-id must be provided');
+        }
+
+        const client = await getTrpcClient();
+        const input: Record<string, any> = {};
+        if (options.operationId) input.operationId = options.operationId;
+        if (options.threadId) input.threadId = options.threadId;
+        if (options.topicId) input.topicId = options.topicId;
+
+        const result = await client.aiAgent.interruptTask.mutate(input as any);
+
+        if (options.json) {
+          outputJson(result);
+          return;
+        }
+
+        const r = result as any;
+        const label = r?.operationId ?? options.operationId ?? options.threadId;
+        if (r?.success) {
+          console.log(`${pc.green('OK')} Interrupted operation ${pc.bold(label)}`);
+        } else {
+          console.log(
+            `${pc.yellow('!')} Interrupt not acknowledged for ${pc.bold(label)} (already finished?)`,
+          );
+        }
+      },
+    );
 }
 
 function colorStatus(status: string): string {
@@ -644,6 +788,59 @@ function colorStatus(status: string): string {
     }
     default: {
       return pc.dim(status);
+    }
+  }
+}
+
+const TERMINAL_RUN_STATUSES = new Set([
+  'completed',
+  'done',
+  'success',
+  'failed',
+  'error',
+  'cancelled',
+  'canceled',
+  'aborted',
+]);
+
+/**
+ * Fallback when the live stream (gateway WebSocket / SSE) drops before the run
+ * finishes: the run is still executing server-side, so poll its status every 10s
+ * until it reaches a terminal state (or is no longer tracked, which also means it
+ * has finished). Avoids hard-exiting on a transient gateway disconnect.
+ */
+async function pollAgentRunStatus(
+  client: Awaited<ReturnType<typeof getTrpcClient>>,
+  operationId: string,
+): Promise<void> {
+  const POLL_MS = 10_000;
+  let lastStatus = '';
+  for (let i = 0; ; i++) {
+    if (i > 0) await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+
+    let r: any;
+    try {
+      r = await client.aiAgent.getOperationStatus.query({ operationId } as any);
+    } catch (error) {
+      log.error(`Status poll failed: ${(error as Error).message}`);
+      process.exit(1);
+    }
+
+    if (!r) {
+      log.info('Run is no longer tracked — finished (or expired).');
+      return;
+    }
+
+    const status = r.status || r.state || 'unknown';
+    if (status !== lastStatus) {
+      lastStatus = status;
+      const steps = r.stepCount !== undefined ? ` · ${r.stepCount} step(s)` : '';
+      log.info(`Run status: ${colorStatus(status)}${steps}`);
+    }
+
+    if (TERMINAL_RUN_STATUSES.has(status)) {
+      if (r.error) log.error(`Run error: ${r.error}`);
+      return;
     }
   }
 }

@@ -1,21 +1,21 @@
 import type { BriefType, TaskDetailActivity } from '@lobechat/types';
 import { Accordion, AccordionItem, Avatar, Empty, Flexbox, Icon, Tag, Text } from '@lobehub/ui';
 import { cssVar } from 'antd-style';
-import dayjs from 'dayjs';
 import type { TFunction } from 'i18next';
 import { BotMessageSquare, CircleDot, CirclePlus, MessageCircle } from 'lucide-react';
 import { memo, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import AgentProfilePopup from '@/features/AgentProfileCard/AgentProfilePopup';
-import BriefCard from '@/features/DailyBrief/BriefCard';
 import type { BriefItem } from '@/features/DailyBrief/types';
+import { useActivityTime } from '@/hooks/useActivityTime';
 import { useTaskStore } from '@/store/task';
 import { taskActivitySelectors, taskDetailSelectors } from '@/store/task/selectors';
 
 import { styles } from '../shared/style';
 import CommentCard from './CommentCard';
 import CommentInput from './CommentInput';
+import TaskBriefCard from './TaskBriefCard';
 import TopicCard from './TopicCard';
 
 const ROW_TYPE_ICON = {
@@ -29,14 +29,17 @@ const toBriefItem = (act: TaskDetailActivity): BriefItem | null => {
   if (!act.id || !act.briefType) return null;
   return {
     actions: (act.actions ?? null) as BriefItem['actions'],
+    agent: act.agent
+      ? {
+          avatar: act.agent.avatar,
+          backgroundColor: act.agent.backgroundColor,
+          id: act.agent.id,
+          name: act.agent.name ?? null,
+          title: act.agent.title ?? null,
+        }
+      : null,
     agentId: act.agentId ?? null,
-    agents: (act.agents ?? []).map((a) => ({
-      avatar: a.avatar,
-      backgroundColor: a.backgroundColor,
-      id: a.id,
-      title: a.title,
-    })),
-    artifacts: act.artifacts,
+    artifacts: act.artifacts ?? null,
     createdAt: act.createdAt ?? act.time ?? new Date().toISOString(),
     cronJobId: act.cronJobId ?? null,
     id: act.id,
@@ -65,7 +68,7 @@ const getRowText = (act: TaskDetailActivity, t: TFunction<'chat'>): string => {
 const ActivityRow = memo<{ activity: TaskDetailActivity }>(({ activity }) => {
   const { t } = useTranslation('chat');
   const TypeIcon = ROW_TYPE_ICON[activity.type as keyof typeof ROW_TYPE_ICON] ?? MessageCircle;
-  const relTime = activity.time ? dayjs(activity.time).fromNow() : '';
+  const { text: relTime, title: relTimeTitle } = useActivityTime(activity.time);
   const text = getRowText(activity, t);
 
   const isAgent = activity.author?.type === 'agent';
@@ -112,7 +115,10 @@ const ActivityRow = memo<{ activity: TaskDetailActivity }>(({ activity }) => {
       <Text ellipsis style={{ color: cssVar.colorTextSecondary, flex: 1, minWidth: 0 }}>
         {text}
         {relTime && (
-          <span style={{ color: cssVar.colorTextQuaternary, marginInlineStart: 4 }}>
+          <span
+            style={{ color: cssVar.colorTextQuaternary, marginInlineStart: 4 }}
+            title={relTimeTitle}
+          >
             · {relTime}
           </span>
         )}
@@ -161,26 +167,37 @@ const TaskActivities = memo(() => {
         <Flexbox gap={12} paddingBlock={12} paddingInline={12}>
           {activeTaskId && <CommentInput taskId={activeTaskId} />}
           {items.length > 0 ? (
-            items.map(({ activity, brief, key }) => {
-              if (brief) {
-                return (
-                  <BriefCard
-                    brief={brief}
-                    enableNavigation={false}
-                    key={key}
-                    onAfterAddComment={refreshActiveTask}
-                    onAfterResolve={refreshActiveTask}
-                  />
-                );
-              }
-              if (activity.type === 'topic') {
-                return <TopicCard activity={activity} key={key} />;
-              }
-              if (activity.type === 'comment') {
-                return <CommentCard activity={activity} key={key} />;
-              }
-              return <ActivityRow activity={activity} key={key} />;
-            })
+            // A goal loop can produce many rounds; only the newest run opens by
+            // default so the latest result is not buried under older ones.
+            (() => {
+              const firstTopicKey = items.find(({ activity }) => activity.type === 'topic')?.key;
+              return items.map(({ activity, brief, key }) => {
+                if (brief) {
+                  return (
+                    <TaskBriefCard
+                      brief={brief}
+                      key={key}
+                      onAfterAddComment={refreshActiveTask}
+                      onAfterDelete={refreshActiveTask}
+                      onAfterResolve={refreshActiveTask}
+                    />
+                  );
+                }
+                if (activity.type === 'topic') {
+                  return (
+                    <TopicCard
+                      activity={activity}
+                      defaultExpanded={key === firstTopicKey}
+                      key={key}
+                    />
+                  );
+                }
+                if (activity.type === 'comment') {
+                  return <CommentCard activity={activity} key={key} />;
+                }
+                return <ActivityRow activity={activity} key={key} />;
+              });
+            })()
           ) : (
             <Empty
               description={t('taskDetail.activitiesEmpty')}

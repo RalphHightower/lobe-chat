@@ -5,30 +5,34 @@ import { useMemo } from 'react';
 import { type ActionsBarConfig, type MessageActionSlot } from '@/features/Conversation/types';
 import { useAgentStore } from '@/store/agent';
 import { agentSelectors } from '@/store/agent/selectors';
-import { useUserStore } from '@/store/user';
-import { userGeneralSettingsSelectors } from '@/store/user/selectors';
 
 /**
- * Hetero-agent (ACP) sessions only support copy + delete — edit / regenerate /
- * branching / translate / tts / share don't apply because the external
- * runtime owns message lifecycle.
+ * Hetero-agent (Claude Code / Codex) sessions keep the menu minimal — copy +
+ * delete — because the external runtime owns the assistant message lifecycle
+ * (edit / regenerate / branching / translate / tts / share don't apply).
+ * `select` remains available because forwarding / batch deletion is handled by
+ * the local conversation UI and does not depend on the external runtime.
+ *
+ * The one user-message action that DOES belong here is `restoreToInput`: a long
+ * CLI run that errors out or loses context is exactly when you want to pull the
+ * original prompt (text + attachments) back into the composer to retry. So it
+ * is scoped to the hetero user menu instead of the native-agent default.
  */
 const HETERO_USER: { bar: MessageActionSlot[]; menu: MessageActionSlot[] } = {
   bar: ['copy'],
-  menu: ['copy', 'divider', 'del'],
+  menu: ['restoreToInput', 'copy', 'divider', 'select', 'divider', 'del'],
 };
 
 const HETERO_ASSISTANT: { bar: MessageActionSlot[]; menu: MessageActionSlot[] } = {
   bar: ['copy'],
-  menu: ['copy', 'divider', 'del'],
+  menu: ['copy', 'divider', 'select', 'divider', 'del'],
 };
 
 export const useActionsBarConfig = (): ActionsBarConfig => {
-  const isDevMode = useUserStore((s) => userGeneralSettingsSelectors.config(s).isDevMode);
-  const hasACPProvider = useAgentStore(agentSelectors.isCurrentAgentHeterogeneous);
+  const isHeteroAgent = useAgentStore(agentSelectors.isCurrentAgentHeterogeneous);
 
   return useMemo<ActionsBarConfig>(() => {
-    if (hasACPProvider) {
+    if (isHeteroAgent) {
       return {
         assistant: HETERO_ASSISTANT,
         assistantGroup: HETERO_ASSISTANT,
@@ -36,15 +40,6 @@ export const useActionsBarConfig = (): ActionsBarConfig => {
       };
     }
 
-    // Dev mode adds `branching` to the default bars. Everything else falls
-    // back to each role's component-level defaults.
-    if (isDevMode) {
-      return {
-        assistant: { bar: ['edit', 'copy', 'branching'] },
-        user: { bar: ['regenerate', 'edit', 'copy', 'branching'] },
-      };
-    }
-
     return {};
-  }, [hasACPProvider, isDevMode]);
+  }, [isHeteroAgent]);
 };

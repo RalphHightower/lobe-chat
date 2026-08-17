@@ -46,7 +46,7 @@ import {
   userMemoriesPreferences,
 } from '../../schemas';
 import type { LobeChatDatabase } from '../../type';
-import { SAFE_BM25_QUERY_OPTIONS, sanitizeBm25Query } from '../../utils/bm25';
+import { normalizeBm25MatchQuery, SAFE_BM25_QUERY_OPTIONS } from '../../utils/bm25';
 import { selectNonVectorColumns } from '../../utils/columns';
 import { TopicModel } from '../topic';
 import type { UserMemoryHybridSearchAggregatedResult } from './query';
@@ -81,6 +81,59 @@ const coerceDate = (input: unknown): Date | null => {
   }
 
   return null;
+};
+
+const escapeLikePattern = (value: string) =>
+  value.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
+
+const buildContainsCondition = (column: unknown, q?: string) => {
+  const normalized = q?.trim();
+  if (!normalized) return undefined;
+
+  return sql<boolean>`${column} ILIKE ${`%${escapeLikePattern(normalized)}%`} ESCAPE '\\'`;
+};
+
+const isPGliteDatabase = (db: LobeChatDatabase) => {
+  const client = (
+    db as unknown as {
+      $client?: {
+        dataDir?: unknown;
+        waitReady?: unknown;
+      };
+    }
+  ).$client;
+
+  return 'waitReady' in (client ?? {}) && 'dataDir' in (client ?? {});
+};
+
+const buildTextSearchCondition = (params: {
+  bm25MatchQuery: string;
+  groups: { fallbackColumns: unknown[]; fields: string[]; keyColumn: AnyColumn }[];
+  normalizedQuery: string;
+  supportsBm25: boolean;
+}) => {
+  const { bm25MatchQuery, groups, normalizedQuery, supportsBm25 } = params;
+
+  if (!normalizedQuery) return undefined;
+
+  const conditions = supportsBm25
+    ? groups
+        .map(({ fields, keyColumn }) => {
+          if (fields.length === 0) return undefined;
+
+          const matchQueries = fields.map(
+            (field) => sql`paradedb.match(${field}, ${bm25MatchQuery}, conjunction_mode => true)`,
+          );
+
+          return sql<boolean>`${keyColumn} @@@ paradedb.boolean(should => ARRAY[${sql.join(matchQueries, sql`, `)}])`;
+        })
+        .filter((condition): condition is SQL<boolean> => Boolean(condition))
+    : groups
+        .flatMap(({ fallbackColumns }) => fallbackColumns)
+        .map((column) => buildContainsCondition(column, normalizedQuery))
+        .filter((condition): condition is SQL<boolean> => Boolean(condition));
+
+  return conditions.length > 0 ? or(...conditions) : undefined;
 };
 
 const parseAssociationExtra = (
@@ -193,7 +246,7 @@ export interface UserMemorySearchAggregatedResult {
   preferences: UserMemoryPreferenceWithoutVectors[];
 }
 
-const pickSingleSearchType = (types?: string[]) => (types?.length === 1 ? types[0] : undefined);
+const _pickSingleSearchType = (types?: string[]) => (types?.length === 1 ? types[0] : undefined);
 
 export interface UpdateUserMemoryVectorsParams {
   detailsVector1024?: number[] | null;
@@ -266,8 +319,7 @@ export interface UpdateIdentityEntryParams {
 
 export interface ContextEntryPayload {
   associatedObjects?:
-    | { extra?: Record<string, unknown>; name?: string; type?: UserMemoryContextObjectType }[]
-    | null;
+    { extra?: Record<string, unknown>; name?: string; type?: UserMemoryContextObjectType }[] | null;
   associatedSubjects?:
     | { extra?: Record<string, unknown>; name?: string; type?: UserMemoryContextSubjectType }[]
     | null;
@@ -500,6 +552,10 @@ export class UserMemoryModel {
     this.db = db;
     this.queryModel = new UserMemoryQueryModel(db, userId);
     this.topicModel = new TopicModel(db, userId);
+  }
+
+  private memoryWhere(table: { userId: any }) {
+    return eq(table.userId, this.userId);
   }
 
   private extractSourceMetadata(metadata?: Record<string, unknown> | null): {
@@ -777,7 +833,7 @@ export class UserMemoryModel {
     const { layers, page = 1, size = 10 } = params;
     const offset = (page - 1) * size;
 
-    const conditions = [eq(userMemories.userId, this.userId)];
+    const conditions = [this.memoryWhere(userMemories)];
     if (layers && layers.length > 0) {
       conditions.push(inArray(userMemories.memoryLayer, layers));
     }
@@ -814,7 +870,7 @@ export class UserMemoryModel {
     const offset = (page - 1) * size;
 
     const identityConditions = [
-      eq(userMemoriesIdentities.userId, this.userId),
+      this.memoryWhere(userMemoriesIdentities),
       eq(userMemoriesIdentities.relationship, RelationshipEnum.Self),
     ];
 
@@ -900,12 +956,30 @@ export class UserMemoryModel {
 
     const normalizedQuery = typeof q === 'string' ? q.trim() : '';
     const resolvedLayer = layer ?? LayersEnum.Context;
-    const bm25Query = normalizedQuery
-      ? sanitizeBm25Query(normalizedQuery, SAFE_BM25_QUERY_OPTIONS)
+    const bm25MatchQuery = normalizedQuery
+      ? normalizeBm25MatchQuery(normalizedQuery, SAFE_BM25_QUERY_OPTIONS)
       : '';
+    // NOTICE:
+    // Why this workaround is needed.
+    // PGlite-based tests do not provide ParadeDB `pg_search`, so BM25 `@@@`
+    // operators fail during local/test execution.
+    //
+    // Root cause summary.
+    // `getTestDB.ts` intentionally skips migrations containing `pg_search` or
+    // `bm25` for PGlite compatibility, which means lexical search paths in this
+    // model cannot rely on BM25 there.
+    //
+    // Source/context.
+    // See `packages/database/src/core/getTestDB.ts` where those migration
+    // statements are filtered out before executing test migrations.
+    //
+    // Removal condition.
+    // Remove this fallback once the test database can execute the same BM25
+    // operators/indexes as the production PostgreSQL environment.
+    const supportsBm25 = !isPGliteDatabase(this.db);
 
     const conditions: Array<SQL | undefined> = [
-      eq(userMemories.userId, this.userId),
+      this.memoryWhere(userMemories),
       categories && categories.length > 0
         ? inArray(userMemories.memoryCategory, categories)
         : undefined,
@@ -969,9 +1043,27 @@ export class UserMemoryModel {
 
         const contextFilters: Array<SQL | undefined> = [
           whereClause,
-          normalizedQuery
-            ? sql`(${userMemories.title} @@@ ${bm25Query} OR ${userMemories.summary} @@@ ${bm25Query} OR ${userMemories.details} @@@ ${bm25Query} OR ${userMemoriesContexts.title} @@@ ${bm25Query} OR ${userMemoriesContexts.description} @@@ ${bm25Query} OR ${userMemoriesContexts.currentStatus} @@@ ${bm25Query})`
-            : undefined,
+          buildTextSearchCondition({
+            bm25MatchQuery,
+            groups: [
+              {
+                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
+                fields: ['title', 'summary', 'details'],
+                keyColumn: userMemories.id,
+              },
+              {
+                fallbackColumns: [
+                  userMemoriesContexts.title,
+                  userMemoriesContexts.description,
+                  userMemoriesContexts.currentStatus,
+                ],
+                fields: ['title', 'description', 'current_status'],
+                keyColumn: userMemoriesContexts.id,
+              },
+            ],
+            normalizedQuery,
+            supportsBm25,
+          }),
           types && types.length > 0 ? inArray(userMemoriesContexts.type, types) : undefined,
           tags && tags.length > 0
             ? or(
@@ -1053,14 +1145,32 @@ export class UserMemoryModel {
         );
         const joinCondition = and(
           eq(userMemories.id, userMemoriesActivities.userMemoryId),
-          eq(userMemoriesActivities.userId, this.userId),
+          this.memoryWhere(userMemoriesActivities),
         );
 
         const activityFilters: Array<SQL | undefined> = [
           whereClause,
-          normalizedQuery
-            ? sql`(${userMemories.title} @@@ ${bm25Query} OR ${userMemories.summary} @@@ ${bm25Query} OR ${userMemories.details} @@@ ${bm25Query} OR ${userMemoriesActivities.narrative} @@@ ${bm25Query} OR ${userMemoriesActivities.notes} @@@ ${bm25Query} OR ${userMemoriesActivities.feedback} @@@ ${bm25Query})`
-            : undefined,
+          buildTextSearchCondition({
+            bm25MatchQuery,
+            groups: [
+              {
+                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
+                fields: ['title', 'summary', 'details'],
+                keyColumn: userMemories.id,
+              },
+              {
+                fallbackColumns: [
+                  userMemoriesActivities.narrative,
+                  userMemoriesActivities.notes,
+                  userMemoriesActivities.feedback,
+                ],
+                fields: ['narrative', 'notes', 'feedback'],
+                keyColumn: userMemoriesActivities.id,
+              },
+            ],
+            normalizedQuery,
+            supportsBm25,
+          }),
           types && types.length > 0 ? inArray(userMemoriesActivities.type, types) : undefined,
           status && status.length > 0 ? inArray(userMemoriesActivities.status, status) : undefined,
           tags && tags.length > 0
@@ -1150,14 +1260,32 @@ export class UserMemoryModel {
         );
         const joinCondition = and(
           eq(userMemories.id, userMemoriesExperiences.userMemoryId),
-          eq(userMemoriesExperiences.userId, this.userId),
+          this.memoryWhere(userMemoriesExperiences),
         );
 
         const experienceFilters: Array<SQL | undefined> = [
           whereClause,
-          normalizedQuery
-            ? sql`(${userMemories.title} @@@ ${bm25Query} OR ${userMemories.summary} @@@ ${bm25Query} OR ${userMemories.details} @@@ ${bm25Query} OR ${userMemoriesExperiences.situation} @@@ ${bm25Query} OR ${userMemoriesExperiences.keyLearning} @@@ ${bm25Query} OR ${userMemoriesExperiences.action} @@@ ${bm25Query})`
-            : undefined,
+          buildTextSearchCondition({
+            bm25MatchQuery,
+            groups: [
+              {
+                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
+                fields: ['title', 'summary', 'details'],
+                keyColumn: userMemories.id,
+              },
+              {
+                fallbackColumns: [
+                  userMemoriesExperiences.situation,
+                  userMemoriesExperiences.keyLearning,
+                  userMemoriesExperiences.action,
+                ],
+                fields: ['situation', 'key_learning', 'action'],
+                keyColumn: userMemoriesExperiences.id,
+              },
+            ],
+            normalizedQuery,
+            supportsBm25,
+          }),
           types && types.length > 0 ? inArray(userMemoriesExperiences.type, types) : undefined,
           tags && tags.length > 0
             ? or(...tags.map((tag) => sql<boolean>`${tag} = ANY(${userMemoriesExperiences.tags})`))
@@ -1227,14 +1355,28 @@ export class UserMemoryModel {
         );
         const joinCondition = and(
           eq(userMemories.id, userMemoriesIdentities.userMemoryId),
-          eq(userMemoriesIdentities.userId, this.userId),
+          this.memoryWhere(userMemoriesIdentities),
         );
 
         const identityFilters: Array<SQL | undefined> = [
           whereClause,
-          normalizedQuery
-            ? sql`(${userMemories.title} @@@ ${bm25Query} OR ${userMemories.summary} @@@ ${bm25Query} OR ${userMemories.details} @@@ ${bm25Query} OR ${userMemoriesIdentities.description} @@@ ${bm25Query} OR ${userMemoriesIdentities.role} @@@ ${bm25Query})`
-            : undefined,
+          buildTextSearchCondition({
+            bm25MatchQuery,
+            groups: [
+              {
+                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
+                fields: ['title', 'summary', 'details'],
+                keyColumn: userMemories.id,
+              },
+              {
+                fallbackColumns: [userMemoriesIdentities.description, userMemoriesIdentities.role],
+                fields: ['description', 'role'],
+                keyColumn: userMemoriesIdentities.id,
+              },
+            ],
+            normalizedQuery,
+            supportsBm25,
+          }),
           types && types.length > 0 ? inArray(userMemoriesIdentities.type, types) : undefined,
           tags && tags.length > 0
             ? or(...tags.map((tag) => sql<boolean>`${tag} = ANY(${userMemoriesIdentities.tags})`))
@@ -1311,14 +1453,31 @@ export class UserMemoryModel {
         );
         const joinCondition = and(
           eq(userMemories.id, userMemoriesPreferences.userMemoryId),
-          eq(userMemoriesPreferences.userId, this.userId),
+          this.memoryWhere(userMemoriesPreferences),
         );
 
         const preferenceFilters: Array<SQL | undefined> = [
           whereClause,
-          normalizedQuery
-            ? sql`(${userMemories.title} @@@ ${bm25Query} OR ${userMemories.summary} @@@ ${bm25Query} OR ${userMemories.details} @@@ ${bm25Query} OR ${userMemoriesPreferences.conclusionDirectives} @@@ ${bm25Query} OR ${userMemoriesPreferences.suggestions} @@@ ${bm25Query})`
-            : undefined,
+          buildTextSearchCondition({
+            bm25MatchQuery,
+            groups: [
+              {
+                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
+                fields: ['title', 'summary', 'details'],
+                keyColumn: userMemories.id,
+              },
+              {
+                fallbackColumns: [
+                  userMemoriesPreferences.conclusionDirectives,
+                  userMemoriesPreferences.suggestions,
+                ],
+                fields: ['conclusion_directives', 'suggestions'],
+                keyColumn: userMemoriesPreferences.id,
+              },
+            ],
+            normalizedQuery,
+            supportsBm25,
+          }),
           types && types.length > 0 ? inArray(userMemoriesPreferences.type, types) : undefined,
           tags && tags.length > 0
             ? or(...tags.map((tag) => sql<boolean>`${tag} = ANY(${userMemoriesPreferences.tags})`))
@@ -1424,12 +1583,10 @@ export class UserMemoryModel {
     const experienceSelection = selectNonVectorColumns(userMemoriesExperiences);
     const identitySelection = selectNonVectorColumns(userMemoriesIdentities);
     const preferenceSelection = selectNonVectorColumns(userMemoriesPreferences);
-    // TODO(@nekomeowww): activity
-    // eslint-disable-next-line unused-imports/no-unused-vars
-    const activitySelection = selectNonVectorColumns(userMemoriesActivities);
+    // TODO(@nekomeowww): extract a shared selection for the activity branch.
 
     const baseConditions: Array<SQL | undefined> = [
-      eq(userMemories.userId, this.userId),
+      this.memoryWhere(userMemories),
       eq(userMemories.memoryLayer, layer),
     ];
     const baseWhere = baseConditions.filter(Boolean) as SQL[];
@@ -1482,7 +1639,7 @@ export class UserMemoryModel {
         );
         const joinCondition = and(
           eq(userMemories.id, userMemoriesExperiences.userMemoryId),
-          eq(userMemoriesExperiences.userId, this.userId),
+          this.memoryWhere(userMemoriesExperiences),
         );
 
         const experienceFilters: Array<SQL | undefined> = [
@@ -1515,7 +1672,7 @@ export class UserMemoryModel {
         );
         const joinCondition = and(
           eq(userMemories.id, userMemoriesIdentities.userMemoryId),
-          eq(userMemoriesIdentities.userId, this.userId),
+          this.memoryWhere(userMemoriesIdentities),
         );
 
         const identityFilters: Array<SQL | undefined> = [
@@ -1548,7 +1705,7 @@ export class UserMemoryModel {
         );
         const joinCondition = and(
           eq(userMemories.id, userMemoriesPreferences.userMemoryId),
-          eq(userMemoriesPreferences.userId, this.userId),
+          this.memoryWhere(userMemoriesPreferences),
         );
 
         const preferenceFilters: Array<SQL | undefined> = [
@@ -1607,7 +1764,7 @@ export class UserMemoryModel {
             userMemoryIds: userMemoriesContexts.userMemoryIds,
           })
           .from(userMemoriesContexts)
-          .where(and(eq(userMemoriesContexts.id, id), eq(userMemoriesContexts.userId, this.userId)))
+          .where(and(eq(userMemoriesContexts.id, id), this.memoryWhere(userMemoriesContexts)))
           .limit(1);
         if (!context) {
           return undefined;
@@ -1666,9 +1823,7 @@ export class UserMemoryModel {
             userMemoryId: userMemoriesActivities.userMemoryId,
           })
           .from(userMemoriesActivities)
-          .where(
-            and(eq(userMemoriesActivities.id, id), eq(userMemoriesActivities.userId, this.userId)),
-          )
+          .where(and(eq(userMemoriesActivities.id, id), this.memoryWhere(userMemoriesActivities)))
           .limit(1);
         if (!activity?.userMemoryId) {
           return undefined;
@@ -1713,12 +1868,7 @@ export class UserMemoryModel {
             userMemoryId: userMemoriesExperiences.userMemoryId,
           })
           .from(userMemoriesExperiences)
-          .where(
-            and(
-              eq(userMemoriesExperiences.id, id),
-              eq(userMemoriesExperiences.userId, this.userId),
-            ),
-          )
+          .where(and(eq(userMemoriesExperiences.id, id), this.memoryWhere(userMemoriesExperiences)))
           .limit(1);
         if (!experience?.userMemoryId) {
           return undefined;
@@ -1762,9 +1912,7 @@ export class UserMemoryModel {
             userMemoryId: userMemoriesIdentities.userMemoryId,
           })
           .from(userMemoriesIdentities)
-          .where(
-            and(eq(userMemoriesIdentities.id, id), eq(userMemoriesIdentities.userId, this.userId)),
-          )
+          .where(and(eq(userMemoriesIdentities.id, id), this.memoryWhere(userMemoriesIdentities)))
           .limit(1);
         if (!identity?.userMemoryId) {
           return undefined;
@@ -1807,12 +1955,7 @@ export class UserMemoryModel {
             userMemoryId: userMemoriesPreferences.userMemoryId,
           })
           .from(userMemoriesPreferences)
-          .where(
-            and(
-              eq(userMemoriesPreferences.id, id),
-              eq(userMemoriesPreferences.userId, this.userId),
-            ),
-          )
+          .where(and(eq(userMemoriesPreferences.id, id), this.memoryWhere(userMemoriesPreferences)))
           .limit(1);
         if (!preference?.userMemoryId) {
           return undefined;
@@ -1864,7 +2007,7 @@ export class UserMemoryModel {
         userId: userMemories.userId,
       })
       .from(userMemories)
-      .where(and(eq(userMemories.id, memoryId), eq(userMemories.userId, this.userId)))
+      .where(and(eq(userMemories.id, memoryId), this.memoryWhere(userMemories)))
       .limit(1);
     if (!memory) {
       return undefined;
@@ -1875,7 +2018,7 @@ export class UserMemoryModel {
 
   findById = async (id: string): Promise<UserMemoryItem | undefined> => {
     const result = await this.db.query.userMemories.findFirst({
-      where: and(eq(userMemories.id, id), eq(userMemories.userId, this.userId)),
+      where: and(eq(userMemories.id, id), this.memoryWhere(userMemories)),
     });
 
     if (result) {
@@ -1889,7 +2032,7 @@ export class UserMemoryModel {
     await this.db
       .update(userMemories)
       .set({ ...params, updatedAt: new Date() })
-      .where(and(eq(userMemories.id, id), eq(userMemories.userId, this.userId)));
+      .where(and(eq(userMemories.id, id), this.memoryWhere(userMemories)));
   };
 
   updateUserMemoryVectors = async (
@@ -1914,7 +2057,7 @@ export class UserMemoryModel {
         ...vectorUpdates,
         updatedAt: new Date(),
       })
-      .where(and(eq(userMemories.id, id), eq(userMemories.userId, this.userId)));
+      .where(and(eq(userMemories.id, id), this.memoryWhere(userMemories)));
   };
 
   updateContextVectors = async (id: string, vectors: UpdateContextVectorsParams): Promise<void> => {
@@ -1932,7 +2075,7 @@ export class UserMemoryModel {
         ...vectorUpdates,
         updatedAt: new Date(),
       })
-      .where(and(eq(userMemoriesContexts.id, id), eq(userMemoriesContexts.userId, this.userId)));
+      .where(and(eq(userMemoriesContexts.id, id), this.memoryWhere(userMemoriesContexts)));
   };
 
   updatePreferenceVectors = async (
@@ -1954,9 +2097,7 @@ export class UserMemoryModel {
         ...vectorUpdates,
         updatedAt: new Date(),
       })
-      .where(
-        and(eq(userMemoriesPreferences.id, id), eq(userMemoriesPreferences.userId, this.userId)),
-      );
+      .where(and(eq(userMemoriesPreferences.id, id), this.memoryWhere(userMemoriesPreferences)));
   };
 
   updateIdentityVectors = async (
@@ -1978,9 +2119,7 @@ export class UserMemoryModel {
         ...vectorUpdates,
         updatedAt: new Date(),
       })
-      .where(
-        and(eq(userMemoriesIdentities.id, id), eq(userMemoriesIdentities.userId, this.userId)),
-      );
+      .where(and(eq(userMemoriesIdentities.id, id), this.memoryWhere(userMemoriesIdentities)));
   };
 
   updateExperienceVectors = async (
@@ -2008,9 +2147,7 @@ export class UserMemoryModel {
         ...vectorUpdates,
         updatedAt: new Date(),
       })
-      .where(
-        and(eq(userMemoriesExperiences.id, id), eq(userMemoriesExperiences.userId, this.userId)),
-      );
+      .where(and(eq(userMemoriesExperiences.id, id), this.memoryWhere(userMemoriesExperiences)));
   };
 
   updateActivityVectors = async (
@@ -2035,9 +2172,7 @@ export class UserMemoryModel {
         ...vectorUpdates,
         updatedAt: new Date(),
       })
-      .where(
-        and(eq(userMemoriesActivities.id, id), eq(userMemoriesActivities.userId, this.userId)),
-      );
+      .where(and(eq(userMemoriesActivities.id, id), this.memoryWhere(userMemoriesActivities)));
   };
 
   addIdentityEntry = async (params: AddIdentityEntryParams): Promise<AddIdentityEntryResult> => {
@@ -2113,7 +2248,7 @@ export class UserMemoryModel {
       const identity = await tx.query.userMemoriesIdentities.findFirst({
         where: and(
           eq(userMemoriesIdentities.id, params.identityId),
-          eq(userMemoriesIdentities.userId, this.userId),
+          this.memoryWhere(userMemoriesIdentities),
         ),
       });
       if (!identity || !identity.userMemoryId) {
@@ -2134,9 +2269,7 @@ export class UserMemoryModel {
           await tx
             .update(userMemories)
             .set(baseUpdate)
-            .where(
-              and(eq(userMemories.id, identity.userMemoryId), eq(userMemories.userId, this.userId)),
-            );
+            .where(and(eq(userMemories.id, identity.userMemoryId), this.memoryWhere(userMemories)));
         }
       }
 
@@ -2200,7 +2333,7 @@ export class UserMemoryModel {
             .where(
               and(
                 eq(userMemoriesIdentities.id, params.identityId),
-                eq(userMemoriesIdentities.userId, this.userId),
+                this.memoryWhere(userMemoriesIdentities),
               ),
             );
         }
@@ -2215,7 +2348,7 @@ export class UserMemoryModel {
       const identity = await tx.query.userMemoriesIdentities.findFirst({
         where: and(
           eq(userMemoriesIdentities.id, identityId),
-          eq(userMemoriesIdentities.userId, this.userId),
+          this.memoryWhere(userMemoriesIdentities),
         ),
       });
 
@@ -2225,9 +2358,7 @@ export class UserMemoryModel {
 
       await tx
         .delete(userMemories)
-        .where(
-          and(eq(userMemories.id, identity.userMemoryId), eq(userMemories.userId, this.userId)),
-        );
+        .where(and(eq(userMemories.id, identity.userMemoryId), this.memoryWhere(userMemories)));
 
       return true;
     });
@@ -2236,10 +2367,7 @@ export class UserMemoryModel {
   removeContextEntry = async (contextId: string): Promise<boolean> => {
     return this.db.transaction(async (tx) => {
       const context = await tx.query.userMemoriesContexts.findFirst({
-        where: and(
-          eq(userMemoriesContexts.id, contextId),
-          eq(userMemoriesContexts.userId, this.userId),
-        ),
+        where: and(eq(userMemoriesContexts.id, contextId), this.memoryWhere(userMemoriesContexts)),
       });
 
       if (!context) {
@@ -2253,15 +2381,13 @@ export class UserMemoryModel {
       if (memoryIds.length > 0) {
         await tx
           .delete(userMemories)
-          .where(and(inArray(userMemories.id, memoryIds), eq(userMemories.userId, this.userId)));
+          .where(and(inArray(userMemories.id, memoryIds), this.memoryWhere(userMemories)));
       }
 
       // Delete the context entry
       await tx
         .delete(userMemoriesContexts)
-        .where(
-          and(eq(userMemoriesContexts.id, contextId), eq(userMemoriesContexts.userId, this.userId)),
-        );
+        .where(and(eq(userMemoriesContexts.id, contextId), this.memoryWhere(userMemoriesContexts)));
 
       return true;
     });
@@ -2272,7 +2398,7 @@ export class UserMemoryModel {
       const experience = await tx.query.userMemoriesExperiences.findFirst({
         where: and(
           eq(userMemoriesExperiences.id, experienceId),
-          eq(userMemoriesExperiences.userId, this.userId),
+          this.memoryWhere(userMemoriesExperiences),
         ),
       });
 
@@ -2283,9 +2409,7 @@ export class UserMemoryModel {
       // Delete the base user memory (cascade will handle the experience)
       await tx
         .delete(userMemories)
-        .where(
-          and(eq(userMemories.id, experience.userMemoryId), eq(userMemories.userId, this.userId)),
-        );
+        .where(and(eq(userMemories.id, experience.userMemoryId), this.memoryWhere(userMemories)));
 
       return true;
     });
@@ -2296,7 +2420,7 @@ export class UserMemoryModel {
       const preference = await tx.query.userMemoriesPreferences.findFirst({
         where: and(
           eq(userMemoriesPreferences.id, preferenceId),
-          eq(userMemoriesPreferences.userId, this.userId),
+          this.memoryWhere(userMemoriesPreferences),
         ),
       });
 
@@ -2307,9 +2431,7 @@ export class UserMemoryModel {
       // Delete the base user memory (cascade will handle the preference)
       await tx
         .delete(userMemories)
-        .where(
-          and(eq(userMemories.id, preference.userMemoryId), eq(userMemories.userId, this.userId)),
-        );
+        .where(and(eq(userMemories.id, preference.userMemoryId), this.memoryWhere(userMemories)));
 
       return true;
     });
@@ -2318,11 +2440,11 @@ export class UserMemoryModel {
   delete = async (id: string): Promise<void> => {
     await this.db
       .delete(userMemories)
-      .where(and(eq(userMemories.id, id), eq(userMemories.userId, this.userId)));
+      .where(and(eq(userMemories.id, id), this.memoryWhere(userMemories)));
   };
 
   deleteAll = async (): Promise<void> => {
-    await this.db.delete(userMemories).where(eq(userMemories.userId, this.userId));
+    await this.db.delete(userMemories).where(this.memoryWhere(userMemories));
   };
 
   searchActivities = async (params: {
@@ -2364,7 +2486,7 @@ export class UserMemoryModel {
       .from(userMemoriesActivities)
       .$dynamic();
 
-    const conditions = [eq(userMemoriesActivities.userId, this.userId)];
+    const conditions = [this.memoryWhere(userMemoriesActivities)];
     if (type) {
       conditions.push(eq(userMemoriesActivities.type, type));
     }
@@ -2415,7 +2537,7 @@ export class UserMemoryModel {
       .from(userMemoriesContexts)
       .$dynamic();
 
-    const conditions = [eq(userMemoriesContexts.userId, this.userId)];
+    const conditions = [this.memoryWhere(userMemoriesContexts)];
     if (type) {
       conditions.push(eq(userMemoriesContexts.type, type));
     }
@@ -2466,7 +2588,7 @@ export class UserMemoryModel {
       .from(userMemoriesExperiences)
       .$dynamic();
 
-    const conditions = [eq(userMemoriesExperiences.userId, this.userId)];
+    const conditions = [this.memoryWhere(userMemoriesExperiences)];
     if (type) {
       conditions.push(eq(userMemoriesExperiences.type, type));
     }
@@ -2513,7 +2635,7 @@ export class UserMemoryModel {
       .from(userMemoriesPreferences)
       .$dynamic();
 
-    const conditions = [eq(userMemoriesPreferences.userId, this.userId)];
+    const conditions = [this.memoryWhere(userMemoriesPreferences)];
     if (type) {
       conditions.push(eq(userMemoriesPreferences.type, type));
     }
@@ -2532,8 +2654,8 @@ export class UserMemoryModel {
     const res = await this.db
       .select(selectNonVectorColumns(userMemoriesIdentities))
       .from(userMemoriesIdentities)
-      .where(eq(userMemoriesIdentities.userId, this.userId))
-      .orderBy(desc(userMemoriesIdentities.capturedAt));
+      .where(this.memoryWhere(userMemoriesIdentities))
+      .orderBy(desc(userMemoriesIdentities.capturedAt), desc(userMemoriesIdentities.createdAt));
 
     return res;
   };
@@ -2546,8 +2668,8 @@ export class UserMemoryModel {
       })
       .from(userMemoriesIdentities)
       .innerJoin(userMemories, eq(userMemories.id, userMemoriesIdentities.userMemoryId))
-      .where(eq(userMemoriesIdentities.userId, this.userId))
-      .orderBy(desc(userMemoriesIdentities.capturedAt));
+      .where(this.memoryWhere(userMemoriesIdentities))
+      .orderBy(desc(userMemoriesIdentities.capturedAt), desc(userMemoriesIdentities.createdAt));
 
     return res;
   };
@@ -2556,10 +2678,8 @@ export class UserMemoryModel {
     const res = await this.db
       .select(selectNonVectorColumns(userMemoriesIdentities))
       .from(userMemoriesIdentities)
-      .where(
-        and(eq(userMemoriesIdentities.userId, this.userId), eq(userMemoriesIdentities.type, type)),
-      )
-      .orderBy(desc(userMemoriesIdentities.capturedAt));
+      .where(and(this.memoryWhere(userMemoriesIdentities), eq(userMemoriesIdentities.type, type)))
+      .orderBy(desc(userMemoriesIdentities.capturedAt), desc(userMemoriesIdentities.createdAt));
 
     return res;
   };
@@ -2588,7 +2708,7 @@ export class UserMemoryModel {
               accessedCount: sql`${userMemories.accessedCount} + 1`,
               lastAccessedAt: now,
             })
-            .where(and(eq(userMemories.userId, this.userId), eq(userMemories.id, memoryId)));
+            .where(and(this.memoryWhere(userMemories), eq(userMemories.id, memoryId)));
         }
 
         const memories = await tx
@@ -2597,9 +2717,7 @@ export class UserMemoryModel {
             layer: userMemories.memoryLayer,
           })
           .from(userMemories)
-          .where(
-            and(eq(userMemories.userId, this.userId), inArray(userMemories.id, orderedMemoryIds)),
-          );
+          .where(and(this.memoryWhere(userMemories), inArray(userMemories.id, orderedMemoryIds)));
 
         const experienceIds = memories
           .filter((memory) => memory.layer === 'experience')
@@ -2610,7 +2728,7 @@ export class UserMemoryModel {
             .set({ accessedAt: now })
             .where(
               and(
-                eq(userMemoriesExperiences.userId, this.userId),
+                this.memoryWhere(userMemoriesExperiences),
                 inArray(userMemoriesExperiences.userMemoryId, experienceIds),
               ),
             );
@@ -2625,7 +2743,7 @@ export class UserMemoryModel {
             .set({ accessedAt: now })
             .where(
               and(
-                eq(userMemoriesIdentities.userId, this.userId),
+                this.memoryWhere(userMemoriesIdentities),
                 inArray(userMemoriesIdentities.userMemoryId, identityIds),
               ),
             );
@@ -2640,7 +2758,7 @@ export class UserMemoryModel {
             .set({ accessedAt: now })
             .where(
               and(
-                eq(userMemoriesPreferences.userId, this.userId),
+                this.memoryWhere(userMemoriesPreferences),
                 inArray(userMemoriesPreferences.userMemoryId, preferenceIds),
               ),
             );
@@ -2653,7 +2771,7 @@ export class UserMemoryModel {
           .set({ accessedAt: now })
           .where(
             and(
-              eq(userMemoriesContexts.userId, this.userId),
+              this.memoryWhere(userMemoriesContexts),
               inArray(userMemoriesContexts.id, orderedContextIds),
             ),
           );

@@ -1,18 +1,11 @@
 'use client';
 
-import {
-  ActionIcon,
-  Block,
-  DropdownMenu,
-  Flexbox,
-  Icon,
-  Modal,
-  stopPropagation,
-} from '@lobehub/ui';
-import { App, Button } from 'antd';
+import { ActionIcon, Block, DropdownMenu, Flexbox, Icon, stopPropagation } from '@lobehub/ui';
+import { Button, confirmModal, createModal } from '@lobehub/ui/base-ui';
 import isEqual from 'fast-deep-equal';
+import { t as translate } from 'i18next';
 import { MoreVerticalIcon, Plus, Trash2 } from 'lucide-react';
-import React, { memo, Suspense, useState } from 'react';
+import React, { memo, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import MCPTag from '@/components/Plugins/MCPTag';
@@ -20,6 +13,7 @@ import PluginAvatar from '@/components/Plugins/PluginAvatar';
 import McpDetail from '@/features/MCP/MCPDetail';
 import McpDetailLoading from '@/features/MCP/MCPDetail/Loading';
 import MCPInstallProgress from '@/features/MCP/MCPInstallProgress';
+import { usePermission } from '@/hooks/usePermission';
 import { useMarketAuth } from '@/layout/AuthProvider/MarketAuth';
 import { useAgentStore } from '@/store/agent';
 import { agentSelectors } from '@/store/agent/selectors';
@@ -29,11 +23,23 @@ import { type DiscoverMcpItem } from '@/types/discover';
 
 import { itemStyles } from '../style';
 
+const openSkillDetailModal = (identifier: string) =>
+  createModal({
+    content: (
+      <Suspense fallback={<McpDetailLoading />}>
+        <McpDetail noSettings identifier={identifier} />
+      </Suspense>
+    ),
+    footer: null,
+    title: translate('dev.title.skillDetails', { ns: 'plugin' }),
+    width: 800,
+  });
+
 const Item = memo<DiscoverMcpItem>(({ name, description, icon, identifier }) => {
   const styles = itemStyles;
   const { t } = useTranslation('plugin');
-  const { modal } = App.useApp();
-  const [detailOpen, setDetailOpen] = useState(false);
+  const { allowed: canCreate } = usePermission('create_content');
+  const { allowed: canEdit } = usePermission('edit_own_content');
 
   const [installed, installing, installMCPPlugin, cancelInstallMCPPlugin, unInstallPlugin, plugin] =
     useToolStore((s) => [
@@ -59,9 +65,10 @@ const Item = memo<DiscoverMcpItem>(({ name, description, icon, identifier }) => 
   const isCloudMcp = !!((plugin as any)?.cloudEndPoint || (plugin as any)?.haveCloudEndpoint);
 
   const handleInstall = async () => {
+    if (!canCreate || !canEdit) return;
     if (isCloudMcp && !isAuthenticated) {
       try {
-        await signIn();
+        await signIn('mcp');
       } catch {
         return;
       }
@@ -87,12 +94,13 @@ const Item = memo<DiscoverMcpItem>(({ name, description, icon, identifier }) => 
           items={[
             {
               danger: true,
+              disabled: !canEdit,
               icon: <Icon icon={Trash2} />,
               key: 'uninstall',
               label: t('store.actions.uninstall'),
               onClick: () => {
-                modal.confirm({
-                  centered: true,
+                if (!canEdit) return;
+                confirmModal({
                   okButtonProps: { danger: true },
                   onOk: async () => {
                     if (isPluginEnabledInAgent) {
@@ -101,7 +109,6 @@ const Item = memo<DiscoverMcpItem>(({ name, description, icon, identifier }) => 
                     await unInstallPlugin(identifier);
                   },
                   title: t('store.actions.confirmUninstall'),
-                  type: 'error',
                 });
               },
             },
@@ -114,59 +121,52 @@ const Item = memo<DiscoverMcpItem>(({ name, description, icon, identifier }) => 
 
     if (installing) {
       return (
-        <Button size="small" variant={'filled'} onClick={handleCancel}>
+        <Button size="small" type="fill" onClick={handleCancel}>
           {t('store.actions.cancel')}
         </Button>
       );
     }
 
-    return <ActionIcon icon={Plus} title={t('store.actions.install')} onClick={handleInstall} />;
+    return (
+      <ActionIcon
+        disabled={!canCreate || !canEdit}
+        icon={Plus}
+        title={t('store.actions.install')}
+        onClick={handleInstall}
+      />
+    );
   };
 
   return (
-    <>
-      <Flexbox className={styles.container} gap={0}>
-        <Block
-          clickable
-          horizontal
-          align={'center'}
-          gap={12}
-          paddingBlock={12}
-          paddingInline={12}
-          style={{ cursor: 'pointer' }}
-          variant={'outlined'}
-          onClick={() => setDetailOpen(true)}
-        >
-          <PluginAvatar avatar={icon} size={40} />
-          <Flexbox flex={1} gap={4} style={{ minWidth: 0, overflow: 'hidden' }}>
-            <Flexbox horizontal align="center" gap={8}>
-              <span className={styles.title}>{name}</span>
-              <MCPTag showText={false} />
-            </Flexbox>
-            {description && <span className={styles.description}>{description}</span>}
-          </Flexbox>
-          <div onClick={stopPropagation}>{renderAction()}</div>
-        </Block>
-
-        {!!installProgress && (
-          <Flexbox paddingInline={12}>
-            <MCPInstallProgress identifier={identifier} />
-          </Flexbox>
-        )}
-      </Flexbox>
-      <Modal
-        destroyOnHidden
-        footer={null}
-        open={detailOpen}
-        title={t('dev.title.skillDetails')}
-        width={800}
-        onCancel={() => setDetailOpen(false)}
+    <Flexbox className={styles.container} gap={0}>
+      <Block
+        clickable
+        horizontal
+        align={'center'}
+        gap={12}
+        paddingBlock={12}
+        paddingInline={12}
+        style={{ cursor: 'pointer' }}
+        variant={'outlined'}
+        onClick={() => openSkillDetailModal(identifier)}
       >
-        <Suspense fallback={<McpDetailLoading />}>
-          <McpDetail noSettings identifier={identifier} />
-        </Suspense>
-      </Modal>
-    </>
+        <PluginAvatar avatar={icon} size={40} />
+        <Flexbox flex={1} gap={4} style={{ minWidth: 0, overflow: 'hidden' }}>
+          <Flexbox horizontal align="center" gap={8}>
+            <span className={styles.title}>{name}</span>
+            <MCPTag showText={false} />
+          </Flexbox>
+          {description && <span className={styles.description}>{description}</span>}
+        </Flexbox>
+        <div onClick={stopPropagation}>{renderAction()}</div>
+      </Block>
+
+      {!!installProgress && (
+        <Flexbox paddingInline={12}>
+          <MCPInstallProgress identifier={identifier} />
+        </Flexbox>
+      )}
+    </Flexbox>
   );
 });
 

@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getTestDB } from '../../core/getTestDB';
-import { agentBotProviders, agents, users } from '../../schemas';
+import { agentBotProviders, agents, users, workspaces } from '../../schemas';
 import type { LobeChatDatabase } from '../../type';
 import { AgentBotProviderModel } from '../agentBotProvider';
 
@@ -337,6 +337,117 @@ describe('AgentBotProviderModel', () => {
     });
   });
 
+  describe('findEnabledByPlatformAndAppId (static)', () => {
+    it('should find an enabled provider that lives in a workspace (system-wide, ignores ownership scope)', async () => {
+      // Regression: workspace-scoped bots could not be connected because the
+      // gateway looked them up in personal scope (workspace_id IS NULL).
+      const workspaceId = 'bot-provider-test-workspace';
+      await serverDB.insert(workspaces).values({
+        id: workspaceId,
+        name: 'Test WS',
+        primaryOwnerId: userId,
+        slug: 'test-ws',
+      });
+
+      const wsModel = new AgentBotProviderModel(serverDB, userId, mockGateKeeper, workspaceId);
+      await wsModel.create({
+        agentId,
+        applicationId: 'ws-app',
+        credentials: { botToken: 'ws-tok' },
+        platform: 'discord',
+      });
+
+      // The personal-scope instance lookup misses the workspace row — this is
+      // the exact failure the static method exists to avoid.
+      const personalModel = new AgentBotProviderModel(serverDB, userId, mockGateKeeper);
+      expect(await personalModel.findEnabledByApplicationId('discord', 'ws-app')).toBeNull();
+
+      // The system-wide static lookup finds it and decrypts credentials.
+      const result = await AgentBotProviderModel.findEnabledByPlatformAndAppId(
+        serverDB,
+        'discord',
+        'ws-app',
+        mockGateKeeper,
+      );
+      expect(result).not.toBeNull();
+      expect(result!.applicationId).toBe('ws-app');
+      expect(result!.workspaceId).toBe(workspaceId);
+      expect(result!.credentials.botToken).toBe('ws-tok');
+    });
+
+    it('should find a provider owned by any user', async () => {
+      const model2 = new AgentBotProviderModel(serverDB, userId2);
+      await model2.create({
+        agentId: agentId2,
+        applicationId: 'other-user-app',
+        credentials: { botToken: 'tok' },
+        platform: 'slack',
+      });
+
+      const result = await AgentBotProviderModel.findEnabledByPlatformAndAppId(
+        serverDB,
+        'slack',
+        'other-user-app',
+      );
+      expect(result).not.toBeNull();
+      expect(result!.applicationId).toBe('other-user-app');
+    });
+
+    it('should return null for a disabled provider', async () => {
+      const model = new AgentBotProviderModel(serverDB, userId);
+      const created = await model.create({
+        agentId,
+        applicationId: 'disabled-app',
+        credentials: { botToken: 'tok' },
+        platform: 'discord',
+      });
+      await model.update(created.id, { enabled: false });
+
+      const result = await AgentBotProviderModel.findEnabledByPlatformAndAppId(
+        serverDB,
+        'discord',
+        'disabled-app',
+      );
+      expect(result).toBeNull();
+    });
+
+    it('should return null for a non-existent combination', async () => {
+      const result = await AgentBotProviderModel.findEnabledByPlatformAndAppId(
+        serverDB,
+        'discord',
+        'no-such-app',
+      );
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('findByAgentId (static)', () => {
+    it('should return all providers for an agent regardless of ownership scope, decrypted', async () => {
+      const model = new AgentBotProviderModel(serverDB, userId, mockGateKeeper);
+      await model.create({
+        agentId,
+        applicationId: 'agent-app-1',
+        credentials: { botToken: 'tok-1' },
+        platform: 'discord',
+      });
+      const disabled = await model.create({
+        agentId,
+        applicationId: 'agent-app-2',
+        credentials: { botToken: 'tok-2' },
+        platform: 'slack',
+      });
+      await model.update(disabled.id, { enabled: false });
+
+      const results = await AgentBotProviderModel.findByAgentId(serverDB, agentId, mockGateKeeper);
+
+      // Returns both enabled and disabled rows (caller filters by `enabled`).
+      expect(results).toHaveLength(2);
+      const byApp = Object.fromEntries(results.map((r) => [r.applicationId, r]));
+      expect(byApp['agent-app-1'].credentials.botToken).toBe('tok-1');
+      expect(byApp['agent-app-2'].credentials.botToken).toBe('tok-2');
+    });
+  });
+
   describe('findEnabledByPlatform (static)', () => {
     it('should return Discord providers with botToken', async () => {
       const model = new AgentBotProviderModel(serverDB, userId);
@@ -368,18 +479,25 @@ describe('AgentBotProviderModel', () => {
       expect(results[0].credentials.signingSecret).toBe('ss-123');
     });
 
-    it('should skip providers without botToken', async () => {
+    it('should return providers regardless of credential field shape (platform validates its own fields)', async () => {
       await serverDB.insert(agentBotProviders).values({
         agentId,
-        applicationId: 'no-token-app',
-        credentials: JSON.stringify({ publicKey: 'pk-only' }),
+        applicationId: 'line-app',
+        credentials: JSON.stringify({
+          channelAccessToken: 'cat-123',
+          channelSecret: 'cs-456',
+        }),
         enabled: true,
-        platform: 'discord',
+        platform: 'line',
         userId,
       });
 
-      const results = await AgentBotProviderModel.findEnabledByPlatform(serverDB, 'discord');
-      expect(results).toHaveLength(0);
+      const results = await AgentBotProviderModel.findEnabledByPlatform(serverDB, 'line');
+      expect(results).toHaveLength(1);
+      expect(results[0].credentials).toEqual({
+        channelAccessToken: 'cat-123',
+        channelSecret: 'cs-456',
+      });
     });
 
     it('should skip providers with null credentials', async () => {

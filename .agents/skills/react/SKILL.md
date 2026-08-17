@@ -1,94 +1,88 @@
 ---
 name: react
-description: React component development guide. Use when working with React components (.tsx files), creating UI, using @lobehub/ui components, implementing routing, or building frontend features. Triggers on React component creation, modification, layout implementation, or navigation tasks.
+description: 'LobeHub React component conventions. Use when editing TSX UI, choosing base-ui vs @lobehub/ui vs antd, styling with antd-style, component boundaries, local state, layouts, render performance, or memoization.'
+user-invocable: false
 ---
 
 # React Component Writing Guide
 
-- Use antd-style for complex styles; for simple cases, use inline `style` attribute
-  - **Prefer `createStaticStyles` with `cssVar.*`** (zero-runtime) — module-level, no hook call required
-  - Only fall back to `createStyles` + `token` when styles genuinely need runtime computation (dynamic props, JS color fns like `readableColor`/`chroma`)
-  - See `.cursor/docs/createStaticStyles_migration_guide.md` for full pattern
-- Use `Flexbox` and `Center` from `@lobehub/ui` for layouts (see `references/layout-kit.md`)
-- Component priority: `src/components` > `@lobehub/ui/base-ui` > `@lobehub/ui` > custom implementation
-  - Always prefer `@lobehub/ui/base-ui` primitives (Select, Modal, DropdownMenu, Popover, Switch, ScrollArea…) over antd equivalents
-  - Fall back to `@lobehub/ui` higher-level components when base-ui has no match
-  - Only implement a custom component as a last resort — never reach for antd directly
-- Use selectors to access zustand store data
+## Styling
 
-## @lobehub/ui Components
+| Scenario                                                   | Approach                                                       |
+| ---------------------------------------------------------- | -------------------------------------------------------------- |
+| Most cases                                                 | `createStaticStyles` + `cssVar.*` (zero-runtime, module-level) |
+| Simple one-off                                             | Inline `style` attribute                                       |
+| Truly dynamic (JS color fns like `readableColor`/`chroma`) | `createStyles` + `token` — **last resort**                     |
 
-If unsure about component usage, search existing code in this project. Most components extend antd with additional props.
+## Component Priority
 
-Reference: `node_modules/@lobehub/ui/es/index.mjs` for all available components.
+1. **`src/components`** — project-specific reusable components
+2. **`@lobehub/ui/base-ui`** — headless primitives. **If the component lives here, use it. Do NOT import the same-named root export.**
+3. **`@lobehub/ui`** — higher-level / antd-wrapping components (only when no base-ui equivalent)
+4. **antd** — only when neither base-ui nor `@lobehub/ui` root provides it
+5. **Custom implementation** — true last resort
 
-**Common Components:**
+If unsure about available components, search existing code or check `node_modules/@lobehub/ui/es/index.mjs` and `node_modules/@lobehub/ui/es/base-ui/`.
 
-- General: ActionIcon, ActionIconGroup, Block, Button, Icon
-- Data Display: Avatar, Collapse, Empty, Highlighter, Markdown, Tag, Tooltip
-- Data Entry: CodeEditor, CopyButton, EditableText, Form, FormModal, Input, SearchBar, Select
-- Feedback: Alert, Drawer, Modal
-- Layout: Center, DraggablePanel, Flexbox, Grid, Header, MaskShadow
-- Navigation: Burger, Dropdown, Menu, SideNav, Tabs
+### `@lobehub/ui/base-ui` — always prefer for these
 
-## Routing Architecture
+| Component                                  | Import                                                                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `Alert` (+ `AlertProps`)                   | `import { Alert, type AlertProps } from '@lobehub/ui/base-ui';`                                         |
+| `Select` (+ `SelectProps`, `SelectOption`) | `import { Select } from '@lobehub/ui/base-ui';`                                                         |
+| `Modal` (imperative API)                   | `import { createModal, confirmModal, useModalContext, type ModalInstance } from '@lobehub/ui/base-ui';` |
+| `DropdownMenu`                             | `import { DropdownMenu } from '@lobehub/ui/base-ui';`                                                   |
+| `ContextMenu`                              | `import { ContextMenu } from '@lobehub/ui/base-ui';`                                                    |
+| `Popover`                                  | `import { Popover } from '@lobehub/ui/base-ui';`                                                        |
+| `ScrollArea`                               | `import { ScrollArea } from '@lobehub/ui/base-ui';`                                                     |
+| `Switch`                                   | `import { Switch } from '@lobehub/ui/base-ui';`                                                         |
+| `Toast`                                    | `import { Toast } from '@lobehub/ui/base-ui';`                                                          |
+| `FloatingSheet`                            | `import { FloatingSheet } from '@lobehub/ui/base-ui';`                                                  |
+| `Drawer`                                   | `import { Drawer } from '@lobehub/ui/base-ui';`                                                         |
 
-Hybrid routing: Next.js App Router (static pages) + React Router DOM (main SPA).
+For Modal specifically, see the dedicated **modal** skill — use the imperative `createModal({ content: … })` pattern over the legacy `<Modal open … />` declarative pattern. base-ui has its own `ModalHost` already mounted in `SPAGlobalProvider`.
 
-| Route Type         | Use Case                          | Implementation                                                               |
-| ------------------ | --------------------------------- | ---------------------------------------------------------------------------- |
-| Next.js App Router | Auth pages (login, signup, oauth) | `src/app/[variants]/(auth)/`                                                 |
-| React Router DOM   | Main SPA (chat, settings)         | `desktopRouter.config.tsx` + `desktopRouter.config.desktop.tsx` (must match) |
+> Common slip: `import { Select } from '@lobehub/ui'` looks fine but it's the antd-backed Select. Use base-ui Select. Same for `Modal`, `DropdownMenu`, etc.
 
-### Key Files
+### `@lobehub/ui` root — use when base-ui has no equivalent
 
-- Entry: `src/spa/entry.web.tsx` (web), `src/spa/entry.mobile.tsx`, `src/spa/entry.desktop.tsx`
-- Desktop router (pair — **always edit both** when changing routes): `src/spa/router/desktopRouter.config.tsx` (dynamic imports) and `src/spa/router/desktopRouter.config.desktop.tsx` (sync imports). Drift can cause unregistered routes / blank screen.
-- Mobile router: `src/spa/router/mobileRouter.config.tsx`
-- Router utilities: `src/utils/router.tsx`
+| Category     | Components                                                                            |
+| ------------ | ------------------------------------------------------------------------------------- |
+| General      | ActionIcon, ActionIconGroup, Block, Button, Icon                                      |
+| Data Display | Avatar, Collapse, Empty, Highlighter, Markdown, Tag, Tooltip                          |
+| Data Entry   | CodeEditor, CopyButton, EditableText, Form, Input, InputPassword, SearchBar, TextArea |
+| Layout       | Center, DraggablePanel, Flexbox, Grid, Header, MaskShadow                             |
+| Navigation   | Burger, Menu, SideNav, Tabs                                                           |
 
-### `.desktop.{ts,tsx}` File Sync Rule
+## State
 
-**CRITICAL**: Some files have a `.desktop.ts(x)` variant that Electron uses instead of the base file. When editing a base file, **always check** if a `.desktop` counterpart exists and update it in sync. Drift causes blank pages or missing features in Electron.
+Keep transient state in its smallest useful owner. Extract a custom hook when state transitions and handlers obscure rendering or form a reusable unit; do not extract solely because a component has a particular number of hooks.
 
-Known pairs that must stay in sync:
+Split a component only to establish a real state, reuse, or render-update boundary. Do not split solely to make files smaller.
 
-| Base file (web, dynamic imports)                      | Desktop file (Electron, sync imports)                         |
-| ----------------------------------------------------- | ------------------------------------------------------------- |
-| `src/spa/router/desktopRouter.config.tsx`             | `src/spa/router/desktopRouter.config.desktop.tsx`             |
-| `src/routes/(main)/settings/features/componentMap.ts` | `src/routes/(main)/settings/features/componentMap.desktop.ts` |
+## Render Performance and Memoization
 
-**How to check**: After editing any `.ts` / `.tsx` file, run `Glob` for `<filename>.desktop.{ts,tsx}` in the same directory. If a match exists, update it with the equivalent sync-import change.
+Treat `memo`, `useMemo`, and `useCallback` as opt-in optimizations, not default component wrappers. Before adding one, identify the actual rerender boundary and prefer structural fixes:
 
-### Router Utilities
+1. Split at the update boundary.
+2. Move transient state to its smallest owner.
+3. Use narrow Zustand selectors and avoid broad subscriptions.
 
-```tsx
-import { dynamicElement, redirectElement, ErrorBoundary } from '@/utils/router';
+Do not memoize prop-free or trivially rendered components, or a component that normally receives new objects, arrays, functions, or JSX children. Do not use memoization to compensate for state held too high in the tree.
 
-element: dynamicElement(() => import('./chat'), 'Desktop > Chat');
-element: redirectElement('/settings/profile');
-errorElement: <ErrorBoundary />;
-```
+Use memoization only when the subtree is demonstrably expensive or frequently repeated, its relevant inputs are stable during normal parent renders, and profiling or a concrete render-path analysis identifies the avoided work. State that reason in the implementation summary or PR.
 
-### Navigation
+## Layout
 
-**Important**: For SPA pages, use `Link` from `react-router-dom`, NOT `next/link`.
+Use `Flexbox` and `Center` from `@lobehub/ui`. See `references/layout-kit.md` for full props and examples.
 
-```tsx
-// ❌ Wrong
-import Link from 'next/link';
-<Link href="/">Home</Link>;
+- Use `gap` instead of `margin` for spacing between flex children
+- Use `flex={1}` to fill available space
+- Nest Flexbox for complex layouts; set `overflow: 'auto'` for scrollable regions
 
-// ✅ Correct
-import { Link } from 'react-router-dom';
-<Link to="/">Home</Link>;
+## Related Skills
 
-// In components
-import { useNavigate } from 'react-router-dom';
-const navigate = useNavigate();
-navigate('/chat');
-
-// From stores
-const navigate = useGlobalStore.getState().navigate;
-navigate?.('/settings');
-```
+- **`ux`**: loading visuals and user-facing interaction design. Do not use antd `Spin` / `<Spin />`.
+- **`modal`**: imperative base-ui modal patterns.
+- **`spa-routes`**: SPA navigation, route ownership, router configuration, and `.desktop` variants.
+- **`zustand`**: store structure and selector conventions.

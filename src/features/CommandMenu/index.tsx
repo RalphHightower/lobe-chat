@@ -1,13 +1,13 @@
 'use client';
 
 import { Avatar, stopPropagation } from '@lobehub/ui';
-import { Command } from 'cmdk';
+import { Command, defaultFilter } from 'cmdk';
 import { CornerDownLeft } from 'lucide-react';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { useLocation } from 'react-router-dom';
 
+import { useActiveLocation } from '@/hooks/useActiveLocation';
 import { useGlobalStore } from '@/store/global';
 
 import AskAgentCommands from './AskAgentCommands';
@@ -66,12 +66,29 @@ const CommandMenuContent = memo<CommandMenuContentProps>(({ isClosing, onClose }
     }
   }, [page, setSearch]);
 
+  // Search result items (value prefixed with "search-result ") are already ranked
+  // and ordered server-side — topics/messages by recency. cmdk would otherwise
+  // re-rank them by fuzzy match against the query; returning a constant keeps their
+  // server order (cmdk's sort is stable). They are force-mounted, so visibility is
+  // unaffected. The constant is below a strong command match (1 = exact, ~0.9 =
+  // prefix) so a well-matching built-in command still ranks above search results,
+  // but above incidental fuzzy matches — preserving the prior "rank after built-in
+  // commands" intent while fixing the within-group ordering.
+  const commandFilter = useCallback(
+    (itemValue: string, searchValue: string, keywords?: string[]) => {
+      if (itemValue.startsWith('search-result ')) return 0.5;
+      return defaultFilter?.(itemValue, searchValue, keywords) ?? 0;
+    },
+    [],
+  );
+
   return (
     <div className={styles.overlay} data-closing={isClosing} onClick={onClose}>
       <div onClick={stopPropagation}>
         <Command
           className={styles.commandRoot}
           data-closing={isClosing}
+          filter={commandFilter}
           shouldFilter={page !== 'ask-ai' && !selectedAgent && !search.trimStart().startsWith('@')}
           value={value}
           onValueChange={setValue}
@@ -115,10 +132,16 @@ const CommandMenuContent = memo<CommandMenuContentProps>(({ isClosing, onClose }
 
           <Command.List ref={listRef}>
             {/* Hide cmdk's Empty when we have search results or are loading them,
-               since force-mounted items aren't counted by cmdk's internal filter */}
-            {!(hasSearch && (searchResults.length > 0 || isSearching)) && (
-              <Command.Empty>{t('cmdk.noResults')}</Command.Empty>
-            )}
+               since force-mounted items aren't counted by cmdk's internal filter.
+               The unfiltered search view also renders the marketplace fallback
+               entries whenever the search settles with no results, so it is
+               never truly empty. */}
+            {!(
+              hasSearch &&
+              (searchResults.length > 0 ||
+                isSearching ||
+                (!page && !selectedAgent && !typeFilter && !search.trimStart().startsWith('@')))
+            ) && <Command.Empty>{t('cmdk.noResults')}</Command.Empty>}
 
             {/* Show send command when agent is selected */}
             {selectedAgent && (
@@ -185,7 +208,7 @@ const CommandMenu = memo(() => {
   const [appRoot, setAppRoot] = useState<HTMLElement | null>(null);
   const [isClosing, setIsClosing] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
-  const location = useLocation();
+  const location = useActiveLocation();
   const pathname = location.pathname;
 
   // Ensure we're mounted on the client

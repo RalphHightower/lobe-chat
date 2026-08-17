@@ -1,69 +1,100 @@
 import { Flexbox } from '@lobehub/ui';
-import { memo, useEffect } from 'react';
+import { Button } from '@lobehub/ui/base-ui';
+import { memo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router';
 
+import NotFound from '@/components/404';
+import AsyncError from '@/components/AsyncError';
 import AutoSaveHint from '@/components/Editor/AutoSaveHint';
-import Loading from '@/components/Loading/BrandTextLoading';
+import SurfaceSkeleton from '@/components/Skeleton/Surface';
 import NavHeader from '@/features/NavHeader';
 import ToggleRightPanelButton from '@/features/RightPanel/ToggleRightPanelButton';
 import WideScreenContainer from '@/features/WideScreenContainer';
-import { useChatStore } from '@/store/chat';
+import { useGlobalStore } from '@/store/global';
+import { systemStatusSelectors } from '@/store/global/selectors';
 import { useTaskStore } from '@/store/task';
 import { taskDetailSelectors } from '@/store/task/selectors';
 
 import Breadcrumb from '../shared/Breadcrumb';
-import TaskActivities from './TaskActivities';
-import TaskDetailAssignee from './TaskDetailAssignee';
 import TaskDetailHeaderActions from './TaskDetailHeaderActions';
-import TaskDetailRunPauseAction from './TaskDetailRunPauseAction';
-import TaskDetailTitleInput from './TaskDetailTitleInput';
-import TaskInstruction from './TaskInstruction';
-import TaskModelConfig from './TaskModelConfig';
-import TaskParentBar from './TaskParentBar';
-import TaskProperties from './TaskProperties';
-import TaskSubtasks from './TaskSubtasks';
+import TaskDetailSections from './TaskDetailSections';
 import TopicChatDrawer from './TopicChatDrawer';
+import { useActiveTaskDetail } from './useActiveTaskDetail';
 
 interface TaskDetailPageProps {
-  agentId?: string;
+  showTaskAgentPanelToggle?: boolean;
   taskId: string;
 }
 
-const TaskDetailPage = memo<TaskDetailPageProps>(({ agentId, taskId }) => {
-  const setActiveTaskId = useTaskStore((s) => s.setActiveTaskId);
-  const useFetchTaskDetail = useTaskStore((s) => s.useFetchTaskDetail);
-  const isLoading = useTaskStore(taskDetailSelectors.isTaskDetailLoading);
+const TaskDetailPage = memo<TaskDetailPageProps>(({ taskId, showTaskAgentPanelToggle = true }) => {
+  const { t } = useTranslation('chat');
   const saveStatus = useTaskStore(taskDetailSelectors.taskSaveStatus);
+  const [showTaskAgentPanel, toggleTaskAgentPanel] = useGlobalStore((s) => [
+    systemStatusSelectors.showTaskAgentPanel(s),
+    s.toggleTaskAgentPanel,
+  ]);
 
-  useEffect(() => {
-    setActiveTaskId(taskId);
-    return () => setActiveTaskId(undefined);
-  }, [taskId, setActiveTaskId]);
+  const { isInitialLoading, isNotFound, error, onRetry } = useActiveTaskDetail(taskId);
 
-  // Sync the task's assignee agent into chat store so the right-side
-  // AgentTaskManager conversation knows which agent to talk to.
-  useEffect(() => {
-    if (!agentId) return;
-    useChatStore.setState({ activeAgentId: agentId }, false, 'TaskDetailPage/syncAgentId');
-    return () => {
-      const current = useChatStore.getState().activeAgentId;
-      if (current === agentId) {
-        useChatStore.setState({ activeAgentId: undefined }, false, 'TaskDetailPage/clearAgentId');
-      }
-    };
-  }, [agentId]);
+  // A transient fetch failure (network / 500) is not a 404 — keep the URL and
+  // offer Reload instead of the terminal "task was deleted" dead-end below.
+  if (error) {
+    return (
+      <Flexbox flex={1} height={'100%'} style={{ minHeight: 0, position: 'relative' }}>
+        <NavHeader
+          left={<Breadcrumb taskId={taskId} />}
+          styles={{ left: { paddingLeft: 4, gap: 8 } }}
+        />
+        <Flexbox flex={1} style={{ minHeight: 0, overflowY: 'auto' }}>
+          <AsyncError error={error} variant={'page'} onRetry={onRetry} />
+        </Flexbox>
+      </Flexbox>
+    );
+  }
 
-  useFetchTaskDetail(taskId);
+  if (isNotFound) {
+    return (
+      <Flexbox flex={1} height={'100%'} style={{ minHeight: 0, position: 'relative' }}>
+        <NavHeader
+          left={<Breadcrumb taskId={taskId} />}
+          styles={{ left: { paddingLeft: 4, gap: 8 } }}
+        />
+        <Flexbox flex={1} style={{ minHeight: 0, overflowY: 'auto' }}>
+          <NotFound
+            desc={t('taskDetail.notFound.desc')}
+            title={t('taskDetail.notFound.title')}
+            extra={
+              <Link to={'/tasks'}>
+                <Button type={'primary'}>{t('taskDetail.notFound.backToTasks')}</Button>
+              </Link>
+            }
+          />
+        </Flexbox>
+      </Flexbox>
+    );
+  }
 
   return (
-    <Flexbox flex={1} height={'100%'} style={{ minHeight: 0 }}>
+    <Flexbox flex={1} height={'100%'} style={{ minHeight: 0, position: 'relative' }}>
       <NavHeader
-        right={<ToggleRightPanelButton hideWhenExpanded />}
         left={
           <>
             <Breadcrumb taskId={taskId} />
             <TaskDetailHeaderActions />
-            {saveStatus === 'saving' ? <AutoSaveHint saveStatus={saveStatus} /> : undefined}
+            {saveStatus === 'saving' || saveStatus === 'failed' ? (
+              <AutoSaveHint saveStatus={saveStatus} />
+            ) : undefined}
           </>
+        }
+        right={
+          showTaskAgentPanelToggle ? (
+            <ToggleRightPanelButton
+              hideWhenExpanded
+              expand={showTaskAgentPanel}
+              onToggle={() => toggleTaskAgentPanel()}
+            />
+          ) : undefined
         }
         styles={{
           left: {
@@ -74,30 +105,10 @@ const TaskDetailPage = memo<TaskDetailPageProps>(({ agentId, taskId }) => {
       />
       <Flexbox flex={1} style={{ minHeight: 0, overflowY: 'auto' }}>
         <WideScreenContainer>
-          {isLoading ? (
-            <Loading debugId="TaskDetail" />
+          {isInitialLoading ? (
+            <SurfaceSkeleton header={false} variant={'editor'} />
           ) : (
-            <>
-              <Flexbox gap={4} style={{ paddingBlock: '24px 36px' }}>
-                <TaskDetailTitleInput />
-                <Flexbox horizontal align={'flex-start'} gap={16} justify={'space-between'}>
-                  <Flexbox align={'flex-start'} flex={1} gap={16}>
-                    <TaskParentBar />
-                    <Flexbox horizontal align={'center'} gap={8}>
-                      <TaskDetailAssignee />
-                      <TaskModelConfig />
-                    </Flexbox>
-                    <TaskDetailRunPauseAction />
-                  </Flexbox>
-                  <TaskProperties />
-                </Flexbox>
-              </Flexbox>
-              <Flexbox gap={24} style={{ paddingBottom: 120 }}>
-                <TaskInstruction />
-                <TaskSubtasks />
-                <TaskActivities />
-              </Flexbox>
-            </>
+            <TaskDetailSections />
           )}
         </WideScreenContainer>
       </Flexbox>

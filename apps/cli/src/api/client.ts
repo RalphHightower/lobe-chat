@@ -8,14 +8,16 @@ import { getValidToken } from '../auth/refresh';
 import { CLI_API_KEY_ENV } from '../constants/auth';
 import { resolveServerUrl } from '../settings';
 import { log } from '../utils/logger';
+import { resolveWorkspaceId, withWorkspaceHeader } from './workspace';
 
 export type TrpcClient = ReturnType<typeof createTRPCClient<LambdaRouter>>;
 export type ToolsTrpcClient = ReturnType<typeof createTRPCClient<ToolsRouter>>;
 
-let _client: TrpcClient | undefined;
-let _toolsClient: ToolsTrpcClient | undefined;
+const PERSONAL_KEY = '__personal__';
+const _clients = new Map<string, TrpcClient>();
+const _toolsClients = new Map<string, ToolsTrpcClient>();
 
-async function getAuthAndServer() {
+async function getAuthAndServer(): Promise<{ headers: Record<string, string>; serverUrl: string }> {
   // LOBEHUB_JWT + LOBEHUB_SERVER env vars (used by server-side sandbox execution)
   const envJwt = process.env.LOBEHUB_JWT;
   if (envJwt) {
@@ -53,36 +55,81 @@ async function getAuthAndServer() {
   };
 }
 
-export async function getTrpcClient(): Promise<TrpcClient> {
-  if (_client) return _client;
+export async function getTrpcClient(workspaceId?: string): Promise<TrpcClient> {
+  const wsId = resolveWorkspaceId(workspaceId);
+  const cacheKey = wsId ?? PERSONAL_KEY;
+  const cached = _clients.get(cacheKey);
+  if (cached) return cached;
 
   const { headers, serverUrl } = await getAuthAndServer();
-  _client = createTRPCClient<LambdaRouter>({
+  const client = createTRPCClient<LambdaRouter>({
     links: [
       httpLink({
-        headers,
+        headers: withWorkspaceHeader(headers, wsId),
         transformer: superjson,
         url: `${serverUrl}/trpc/lambda`,
       }),
     ],
   });
+  _clients.set(cacheKey, client);
 
-  return _client;
+  return client;
 }
 
-export async function getToolsTrpcClient(): Promise<ToolsTrpcClient> {
-  if (_toolsClient) return _toolsClient;
+/**
+ * Build a Lambda tRPC client from an already-resolved auth context, without
+ * re-running credential discovery. Use this when the caller already holds a
+ * token (e.g. `lh connect --token <jwt>`) — `getTrpcClient` would re-resolve
+ * via env/stored creds and `process.exit(1)` when none exist, which would
+ * abort an otherwise-valid explicit-token session.
+ */
+export function createLambdaClient(
+  auth: {
+    serverUrl: string;
+    token: string;
+    tokenType: 'apiKey' | 'jwt' | 'serviceToken';
+  },
+  /** When set, scopes the request to a workspace (e.g. workspace-device enrollment). */
+  workspaceId?: string,
+): TrpcClient {
+  const headers: Record<string, string> = {
+    ...(auth.tokenType === 'apiKey' ? { 'X-API-Key': auth.token } : { 'Oidc-Auth': auth.token }),
+  };
 
-  const { headers, serverUrl } = await getAuthAndServer();
-  _toolsClient = createTRPCClient<ToolsRouter>({
+  return createTRPCClient<LambdaRouter>({
     links: [
       httpLink({
-        headers,
+        headers: workspaceId ? { ...headers, 'X-Workspace-Id': workspaceId } : headers,
+        transformer: superjson,
+        url: `${auth.serverUrl}/trpc/lambda`,
+      }),
+    ],
+  });
+}
+
+/**
+ * Same workspace scoping as `getTrpcClient` — the tools router is workspace
+ * aware too, and dropping the header here silently ran every tools call
+ * (web/local search, market) against personal scope, which also mis-attributes
+ * the spend.
+ */
+export async function getToolsTrpcClient(workspaceId?: string): Promise<ToolsTrpcClient> {
+  const wsId = resolveWorkspaceId(workspaceId);
+  const cacheKey = wsId ?? PERSONAL_KEY;
+  const cached = _toolsClients.get(cacheKey);
+  if (cached) return cached;
+
+  const { headers, serverUrl } = await getAuthAndServer();
+  const client = createTRPCClient<ToolsRouter>({
+    links: [
+      httpLink({
+        headers: withWorkspaceHeader(headers, wsId),
         transformer: superjson,
         url: `${serverUrl}/trpc/tools`,
       }),
     ],
   });
+  _toolsClients.set(cacheKey, client);
 
-  return _toolsClient;
+  return client;
 }

@@ -1,4 +1,9 @@
-import { BaseExecutor, type BuiltinToolContext, type BuiltinToolResult } from '@lobechat/types';
+import {
+  BaseExecutor,
+  type BuiltinToolContext,
+  type BuiltinToolResult,
+  type ToolAfterCallContext,
+} from '@lobechat/types';
 
 import { AgentDocumentsExecutionRuntime } from '../ExecutionRuntime';
 import {
@@ -6,16 +11,25 @@ import {
   AgentDocumentsIdentifier,
   type CopyDocumentArgs,
   type CreateDocumentArgs,
-  type EditDocumentArgs,
   type ListDocumentsArgs,
   type ModifyDocumentNodesArgs,
   type ReadDocumentArgs,
-  type ReadDocumentByFilenameArgs,
   type RemoveDocumentArgs,
   type RenameDocumentArgs,
+  type ReplaceDocumentContentArgs,
   type UpdateLoadRuleArgs,
-  type UpsertDocumentByFilenameArgs,
 } from '../types';
+
+// APIs that change the document set the client list renders (membership or
+// visible title). Content-only edits (replaceDocumentContent / modifyNodes) and
+// read-only calls are excluded — they don't alter the list. Used by
+// `onAfterCall` to decide when to refresh the client-side documents list.
+const LIST_MUTATING_APIS = new Set<string>([
+  AgentDocumentsApiName.createDocument,
+  AgentDocumentsApiName.removeDocument,
+  AgentDocumentsApiName.renameDocument,
+  AgentDocumentsApiName.copyDocument,
+]);
 
 export class AgentDocumentsExecutor extends BaseExecutor<typeof AgentDocumentsApiName> {
   readonly identifier = AgentDocumentsIdentifier;
@@ -27,6 +41,15 @@ export class AgentDocumentsExecutor extends BaseExecutor<typeof AgentDocumentsAp
     super();
     this.runtime = runtime;
   }
+
+  // Refresh the client documents list after the agent mutates it. Fires on
+  // `tool_end` regardless of whether the tool ran client- or server-side — the
+  // server-runtime path never touches the client store otherwise, so a created
+  // doc wouldn't appear until a manual refresh.
+  onAfterCall = async ({ apiName, result }: ToolAfterCallContext): Promise<void> => {
+    if (!LIST_MUTATING_APIS.has(apiName) || !result.success) return;
+    await this.runtime.notifyMutated();
+  };
 
   listDocuments = async (
     params: ListDocumentsArgs,
@@ -40,28 +63,6 @@ export class AgentDocumentsExecutor extends BaseExecutor<typeof AgentDocumentsAp
     });
   };
 
-  readDocumentByFilename = async (
-    params: ReadDocumentByFilenameArgs,
-    ctx: BuiltinToolContext,
-  ): Promise<BuiltinToolResult> => {
-    return this.runtime.readDocumentByFilename(params, {
-      agentId: ctx.agentId,
-      currentDocumentId: ctx.documentId,
-      scope: ctx.scope,
-    });
-  };
-
-  upsertDocumentByFilename = async (
-    params: UpsertDocumentByFilenameArgs,
-    ctx: BuiltinToolContext,
-  ): Promise<BuiltinToolResult> => {
-    return this.runtime.upsertDocumentByFilename(params, {
-      agentId: ctx.agentId,
-      currentDocumentId: ctx.documentId,
-      scope: ctx.scope,
-    });
-  };
-
   createDocument = async (
     params: CreateDocumentArgs,
     ctx: BuiltinToolContext,
@@ -69,7 +70,14 @@ export class AgentDocumentsExecutor extends BaseExecutor<typeof AgentDocumentsAp
     return this.runtime.createDocument(params, {
       agentId: ctx.agentId,
       currentDocumentId: ctx.documentId,
+      messageId: ctx.sourceMessageId ?? ctx.messageId,
+      operationId: ctx.operationId,
+      rootOperationId: ctx.rootOperationId,
       scope: ctx.scope,
+      taskId: ctx.taskId,
+      threadId: ctx.threadId,
+      toolCallId: ctx.toolCallId,
+      toolMessageId: ctx.toolMessageId,
       topicId: ctx.topicId,
     });
   };
@@ -85,14 +93,22 @@ export class AgentDocumentsExecutor extends BaseExecutor<typeof AgentDocumentsAp
     });
   };
 
-  editDocument = async (
-    params: EditDocumentArgs,
+  replaceDocumentContent = async (
+    params: ReplaceDocumentContentArgs,
     ctx: BuiltinToolContext,
   ): Promise<BuiltinToolResult> => {
-    return this.runtime.editDocument(params, {
+    return this.runtime.replaceDocumentContent(params, {
       agentId: ctx.agentId,
       currentDocumentId: ctx.documentId,
+      messageId: ctx.sourceMessageId ?? ctx.messageId,
+      operationId: ctx.operationId,
+      rootOperationId: ctx.rootOperationId,
       scope: ctx.scope,
+      taskId: ctx.taskId,
+      threadId: ctx.threadId,
+      toolCallId: ctx.toolCallId,
+      toolMessageId: ctx.toolMessageId,
+      topicId: ctx.topicId,
     });
   };
 
@@ -103,7 +119,15 @@ export class AgentDocumentsExecutor extends BaseExecutor<typeof AgentDocumentsAp
     return this.runtime.modifyNodes(params, {
       agentId: ctx.agentId,
       currentDocumentId: ctx.documentId,
+      messageId: ctx.sourceMessageId ?? ctx.messageId,
+      operationId: ctx.operationId,
+      rootOperationId: ctx.rootOperationId,
       scope: ctx.scope,
+      taskId: ctx.taskId,
+      threadId: ctx.threadId,
+      toolCallId: ctx.toolCallId,
+      toolMessageId: ctx.toolMessageId,
+      topicId: ctx.topicId,
     });
   };
 
@@ -114,7 +138,15 @@ export class AgentDocumentsExecutor extends BaseExecutor<typeof AgentDocumentsAp
     return this.runtime.removeDocument(params, {
       agentId: ctx.agentId,
       currentDocumentId: ctx.documentId,
+      messageId: ctx.sourceMessageId ?? ctx.messageId,
+      operationId: ctx.operationId,
+      rootOperationId: ctx.rootOperationId,
       scope: ctx.scope,
+      taskId: ctx.taskId,
+      threadId: ctx.threadId,
+      toolCallId: ctx.toolCallId,
+      toolMessageId: ctx.toolMessageId,
+      topicId: ctx.topicId,
     });
   };
 
@@ -125,7 +157,15 @@ export class AgentDocumentsExecutor extends BaseExecutor<typeof AgentDocumentsAp
     return this.runtime.renameDocument(params, {
       agentId: ctx.agentId,
       currentDocumentId: ctx.documentId,
+      messageId: ctx.sourceMessageId ?? ctx.messageId,
+      operationId: ctx.operationId,
+      rootOperationId: ctx.rootOperationId,
       scope: ctx.scope,
+      taskId: ctx.taskId,
+      threadId: ctx.threadId,
+      toolCallId: ctx.toolCallId,
+      toolMessageId: ctx.toolMessageId,
+      topicId: ctx.topicId,
     });
   };
 
@@ -136,7 +176,15 @@ export class AgentDocumentsExecutor extends BaseExecutor<typeof AgentDocumentsAp
     return this.runtime.copyDocument(params, {
       agentId: ctx.agentId,
       currentDocumentId: ctx.documentId,
+      messageId: ctx.sourceMessageId ?? ctx.messageId,
+      operationId: ctx.operationId,
+      rootOperationId: ctx.rootOperationId,
       scope: ctx.scope,
+      taskId: ctx.taskId,
+      threadId: ctx.threadId,
+      toolCallId: ctx.toolCallId,
+      toolMessageId: ctx.toolMessageId,
+      topicId: ctx.topicId,
     });
   };
 
@@ -156,16 +204,14 @@ const fallbackRuntime = new AgentDocumentsExecutionRuntime({
   copyDocument: async ({ agentId: _agentId }) => undefined,
   createDocument: async () => undefined,
   createTopicDocument: async () => undefined,
-  editDocument: async ({ agentId: _agentId }) => undefined,
   listDocuments: async () => [],
   listTopicDocuments: async () => [],
   modifyNodes: async ({ agentId: _agentId }) => undefined,
   readDocument: async ({ agentId: _agentId }) => undefined,
-  readDocumentByFilename: async () => undefined,
   removeDocument: async ({ agentId: _agentId }) => false,
   renameDocument: async ({ agentId: _agentId }) => undefined,
+  replaceDocumentContent: async ({ agentId: _agentId }) => undefined,
   updateLoadRule: async ({ agentId: _agentId }) => undefined,
-  upsertDocumentByFilename: async () => undefined,
 });
 
 export const agentDocumentsExecutor = new AgentDocumentsExecutor(fallbackRuntime);

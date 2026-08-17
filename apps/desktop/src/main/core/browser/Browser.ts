@@ -7,18 +7,60 @@ import type { BrowserWindowConstructorOptions } from 'electron';
 import { app, BrowserWindow, ipcMain, screen, session as electronSession, shell } from 'electron';
 
 import { preloadDir, resourcesDir } from '@/const/dir';
-import { isMac } from '@/const/env';
-import { ELECTRON_BE_PROTOCOL_SCHEME } from '@/const/protocol';
+import { DESKTOP_EXTERNAL_NAVIGATION_HOSTS, isMac } from '@/const/env';
 import RemoteServerConfigCtr from '@/controllers/RemoteServerConfigCtr';
 import { backendProxyProtocolManager } from '@/core/infrastructure/BackendProxyProtocolManager';
 import { appendVercelCookie, setResponseHeader } from '@/utils/http-headers';
 import { createLogger } from '@/utils/logger';
+import { getSystemLanguage, resolveUILocale } from '@/utils/system-language';
+import { SYSTEM_LANGUAGE_ARG_PREFIX } from '~common/systemLanguage';
 
 import type { App } from '../App';
 import { WindowStateManager } from './WindowStateManager';
 import { WindowThemeManager } from './WindowThemeManager';
 
 const logger = createLogger('core:Browser');
+const BROWSER_WEBVIEW_PARTITION = 'persist:lobe-browser-app';
+
+const getExternalNavigationHosts = () =>
+  DESKTOP_EXTERNAL_NAVIGATION_HOSTS.split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
+
+const EXTERNALLY_OPENABLE_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
+
+/**
+ * The renderer runs on `app://renderer`, so a link the renderer did not claim can
+ * reach the window-open handler with an internal URL. Handing those to the OS opens
+ * nothing — deny instead of silently failing.
+ */
+const isExternallyOpenableUrl = (rawUrl: string) => {
+  try {
+    return EXTERNALLY_OPENABLE_PROTOCOLS.has(new URL(rawUrl).protocol);
+  } catch {
+    return false;
+  }
+};
+
+const shouldOpenTopLevelNavigationExternally = (rawUrl: string) => {
+  const externalNavigationHosts = getExternalNavigationHosts();
+  if (externalNavigationHosts.length === 0) return false;
+
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+
+  const hostname = url.hostname.toLowerCase();
+
+  return externalNavigationHosts.some(
+    (externalHost) => hostname === externalHost || hostname.endsWith(`.${externalHost}`),
+  );
+};
 
 // ==================== Types ====================
 
@@ -42,6 +84,11 @@ export default class Browser {
   private readonly themeManager: WindowThemeManager;
 
   private _browserWindow?: BrowserWindow;
+  private hasPresentedFirstFrame = false;
+  private resolveFirstFrame!: () => void;
+  private readonly firstFramePromise = new Promise<void>((resolve) => {
+    this.resolveFirstFrame = resolve;
+  });
 
   readonly identifier: string;
   readonly options: BrowserWindowOpts;
@@ -137,6 +184,7 @@ export default class Browser {
       show: false,
       title,
       webPreferences: {
+        additionalArguments: [`${SYSTEM_LANGUAGE_ARG_PREFIX}${getSystemLanguage()}`],
         backgroundThrottling: false,
         contextIsolation: true,
         preload: path.join(preloadDir, 'index.js'),
@@ -175,17 +223,44 @@ export default class Browser {
 
     // Setup external link handler (prevents opening new windows in renderer)
     this.setupWindowOpenHandler(browserWindow);
+    this.setupWebviewSecurity(browserWindow);
+  }
+
+  private setupWebviewSecurity(browserWindow: BrowserWindow): void {
+    browserWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+      if (params.partition !== BROWSER_WEBVIEW_PARTITION) {
+        event.preventDefault();
+        return;
+      }
+
+      let url: URL;
+      try {
+        url = new URL(params.src);
+      } catch {
+        event.preventDefault();
+        return;
+      }
+
+      if (!['about:', 'http:', 'https:'].includes(url.protocol)) {
+        event.preventDefault();
+        return;
+      }
+
+      delete webPreferences.preload;
+      webPreferences.contextIsolation = true;
+      webPreferences.nodeIntegration = false;
+      webPreferences.partition = BROWSER_WEBVIEW_PARTITION;
+      webPreferences.sandbox = true;
+    });
   }
 
   private initiateContentLoading(): void {
-    logger.debug(`[${this.identifier}] Initiating placeholder and URL loading sequence.`);
-    this.loadPlaceholder().then(() => {
-      this.loadUrl(this.options.path).catch((e) => {
-        logger.error(
-          `[${this.identifier}] Initial loadUrl error for path '${this.options.path}':`,
-          e,
-        );
-      });
+    logger.debug(`[${this.identifier}] Loading initial renderer URL directly.`);
+    this.loadUrl(this.options.path).catch((e) => {
+      logger.error(
+        `[${this.identifier}] Initial loadUrl error for path '${this.options.path}':`,
+        e,
+      );
     });
   }
 
@@ -195,8 +270,25 @@ export default class Browser {
     this.setupReadyToShowListener(browserWindow);
     this.setupCloseListener(browserWindow);
     this.setupFocusListener(browserWindow);
+    this.setupFullscreenListener(browserWindow);
+    this.setupTopLevelNavigationListener(browserWindow);
     this.setupWillPreventUnloadListener(browserWindow);
     this.setupContextMenu(browserWindow);
+  }
+
+  private setupTopLevelNavigationListener(browserWindow: BrowserWindow): void {
+    logger.debug(`[${this.identifier}] Setting up top-level navigation listener.`);
+
+    browserWindow.webContents.on('will-navigate', (event, url) => {
+      if (!shouldOpenTopLevelNavigationExternally(url)) return;
+
+      logger.info(`[${this.identifier}] Opening top-level navigation externally: ${url}`);
+      event.preventDefault();
+
+      shell.openExternal(url).catch((error) => {
+        logger.error(`[${this.identifier}] Failed to open external navigation URL: ${url}`, error);
+      });
+    });
   }
 
   /**
@@ -208,6 +300,11 @@ export default class Browser {
 
     browserWindow.webContents.setWindowOpenHandler(({ url }) => {
       logger.info(`[${this.identifier}] Intercepted window open for URL: ${url}`);
+
+      if (!isExternallyOpenableUrl(url)) {
+        logger.debug(`[${this.identifier}] Denied non-external window open URL: ${url}`);
+        return { action: 'deny' };
+      }
 
       // Open external URL in system browser
       shell.openExternal(url).catch((error) => {
@@ -236,6 +333,8 @@ export default class Browser {
     logger.debug(`[${this.identifier}] Setting up 'ready-to-show' event listener.`);
     browserWindow.once('ready-to-show', () => {
       logger.debug(`[${this.identifier}] Window 'ready-to-show' event fired.`);
+      this.hasPresentedFirstFrame = true;
+      this.resolveFirstFrame();
       if (this.options.showOnInit) {
         logger.debug(`Showing window ${this.identifier} because showOnInit is true.`);
         this.show();
@@ -266,6 +365,20 @@ export default class Browser {
       } catch {
         /* noop — some platforms may not support badge counts */
       }
+    });
+  }
+
+  private setupFullscreenListener(browserWindow: BrowserWindow): void {
+    logger.debug(`[${this.identifier}] Setting up fullscreen event listeners.`);
+
+    browserWindow.on('enter-full-screen', () => {
+      this.themeManager.handleFullscreenChange(true);
+      this.broadcast('windowFullscreenChanged', { isFullScreen: true });
+    });
+
+    browserWindow.on('leave-full-screen', () => {
+      this.themeManager.handleFullscreenChange(false);
+      this.broadcast('windowFullscreenChanged', { isFullScreen: false });
     });
   }
 
@@ -407,6 +520,21 @@ export default class Browser {
     logger.debug(`[${this.identifier}] Splash screen placeholder loaded.`);
   };
 
+  /** Wait until Chromium has produced a presentable frame, with a safety timeout. */
+  waitForFirstFrame = async (timeoutMs: number = 5000): Promise<void> => {
+    if (this.hasPresentedFirstFrame) return;
+
+    let timeout: NodeJS.Timeout | undefined;
+    await Promise.race([
+      this.firstFramePromise,
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, timeoutMs);
+        timeout.unref?.();
+      }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+  };
+
   loadUrl = async (path: string): Promise<void> => {
     const initUrl = await this.app.buildRendererUrl(path);
     const urlWithLocale = this.buildUrlWithLocale(initUrl);
@@ -424,11 +552,12 @@ export default class Browser {
   };
 
   private buildUrlWithLocale(initUrl: string): string {
-    const storedLocale = this.app.storeManager.get('locale', 'auto');
-    if (storedLocale && storedLocale !== 'auto') {
-      return `${initUrl}${initUrl.includes('?') ? '&' : '?'}lng=${storedLocale}`;
-    }
-    return initUrl;
+    // Always inject `lng` — including for `auto`, where the main process is the
+    // only side that can resolve the real OS language (the renderer's
+    // `navigator.language` reports English once packaging prunes the app's locales).
+    const locale = resolveUILocale(this.app.storeManager.get('locale', 'auto'));
+
+    return `${initUrl}${initUrl.includes('?') ? '&' : '?'}lng=${locale}`;
   }
 
   private async handleLoadError(urlWithLocale: string): Promise<void> {
@@ -561,7 +690,10 @@ export default class Browser {
   }
 
   /**
-   * Rewrite tRPC requests to remote server and inject OIDC token
+   * Bind this window's session to the backend proxy. The `app://` request
+   * interceptor (wired in `App.ts`) consumes this context to route
+   * `/trpc`, `/webapi`, `/api/auth`, and `/market` requests to the remote
+   * LobeHub server.
    */
   private setupRemoteServerRequestHook(browserWindow: BrowserWindow): void {
     const session = browserWindow.webContents.session;
@@ -577,7 +709,6 @@ export default class Browser {
         const remoteServerUrl = await remoteServerConfigCtr.getRemoteServerUrl(config);
         return remoteServerUrl || null;
       },
-      scheme: ELECTRON_BE_PROTOCOL_SCHEME,
       source: this.identifier,
     });
   }

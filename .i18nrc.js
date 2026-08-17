@@ -27,14 +27,14 @@ module.exports = defineConfig({
   ],
   temperature: 0,
   saveImmediately: true,
-  modelName: 'gpt-5.1-chat-latest',
+  modelName: 'gpt-4o',
   experimental: {
     jsonMode: true,
   },
   markdown: {
     reference:
       'You need to maintain the component format of the mdx file; the output text does not need to be wrapped in any code block syntax on the outermost layer.\n' +
-      fs.readFileSync(path.join(__dirname, 'docs/glossary.md'), 'utf8'),
+      fs.readFileSync(path.join(__dirname, 'docs/glossary.mdx'), 'utf8'),
     entry: ['./README.md', './docs/**/*.md', './docs/**/*.mdx'],
     entryLocale: 'en-US',
     outputLocales: ['zh-CN'],

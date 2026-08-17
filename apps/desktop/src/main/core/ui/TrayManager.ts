@@ -1,4 +1,8 @@
-import type { MainBroadcastEventKey, MainBroadcastParams } from '@lobechat/electron-client-ipc';
+import type {
+  MainBroadcastEventKey,
+  MainBroadcastParams,
+  TrayNavigationSnapshot,
+} from '@lobechat/electron-client-ipc';
 
 import { name } from '@/../../package.json';
 import { isMac } from '@/const/env';
@@ -18,6 +22,7 @@ export type TrayIdentifiers = 'main';
 
 export class TrayManager {
   app: App;
+  private navigationSnapshot: TrayNavigationSnapshot = { agents: [], pinned: [], recent: [] };
 
   /**
    * Store all tray instances
@@ -39,13 +44,19 @@ export class TrayManager {
   initializeTrays() {
     logger.debug('Initialize application tray');
 
+    if (!this.app.storeManager.get('appTrayVisible', true)) {
+      logger.debug('Application tray is disabled by user settings');
+      this.destroyAll();
+      return;
+    }
+
     // Initialize main tray
     const mainTray = this.initializeMainTray();
 
     // Attach the platform-specific context menu built by MenuManager so the
     // tray right-click entries stay in sync with the app menu i18n.
     try {
-      mainTray.setMenu(this.app.menuManager.buildTrayMenu());
+      mainTray.setMenu(this.app.menuManager.buildTrayMenu(this.navigationSnapshot));
     } catch (error) {
       logger.error('Failed to attach tray context menu:', error);
     }
@@ -56,6 +67,25 @@ export class TrayManager {
    */
   getMainTray() {
     return this.retrieveByIdentifier('main');
+  }
+
+  /**
+   * Toggle the application tray at runtime.
+   */
+  setAppTrayVisible(visible: boolean) {
+    logger.debug(`Set application tray visible: ${visible}`);
+
+    if (visible) {
+      this.initializeTrays();
+    } else {
+      this.destroyAll();
+    }
+  }
+
+  updateNavigationSnapshot(snapshot: TrayNavigationSnapshot) {
+    this.navigationSnapshot = snapshot;
+    const mainTray = this.getMainTray();
+    if (mainTray) mainTray.setMenu(this.app.menuManager.buildTrayMenu(snapshot));
   }
 
   /**

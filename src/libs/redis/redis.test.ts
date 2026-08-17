@@ -23,6 +23,8 @@ const buildRedisConfig = (): RedisConfig | null => {
 const loadRedisProvider = async () => (await import('./redis')).IoRedisRedisProvider;
 
 const createMockedProvider = async () => {
+  const instances: Array<{ options: Record<PropertyKey, unknown>; url: string }> = [];
+
   const createPipelineMock = () => {
     const pipeMocks = {
       incr: vi.fn(),
@@ -69,6 +71,7 @@ const createMockedProvider = async () => {
     hdel: vi.fn().mockResolvedValue(1),
     hgetall: vi.fn().mockResolvedValue({ a: '1' }),
     eval: vi.fn().mockResolvedValue(null),
+    scan: vi.fn().mockResolvedValue(['0', []]),
     pipeline: vi.fn().mockReturnValue(pipelineMocks),
   };
 
@@ -77,8 +80,10 @@ const createMockedProvider = async () => {
     class FakeRedis {
       constructor(
         public url: string,
-        public options: any,
-      ) {}
+        public options: Record<PropertyKey, unknown>,
+      ) {
+        instances.push({ options, url });
+      }
       connect = mocks.connect;
       ping = mocks.ping;
       quit = mocks.quit;
@@ -98,6 +103,7 @@ const createMockedProvider = async () => {
       hdel = mocks.hdel;
       hgetall = mocks.hgetall;
       eval = mocks.eval;
+      scan = mocks.scan;
       pipeline = mocks.pipeline;
     }
 
@@ -114,7 +120,7 @@ const createMockedProvider = async () => {
 
   await provider.initialize();
 
-  return { mocks, provider };
+  return { instances, mocks, provider };
 };
 
 const shouldSkipIntegration = (error: unknown) =>
@@ -163,6 +169,22 @@ describe('integrated', (test) => {
 });
 
 describe('mocked', () => {
+  it('sets bounded ioredis connection and command timeouts', async () => {
+    const { instances, provider } = await createMockedProvider();
+
+    expect(instances).toHaveLength(1);
+    expect(instances[0]).toMatchObject({
+      options: {
+        commandTimeout: 10_000,
+        connectTimeout: 10_000,
+        maxRetriesPerRequest: 2,
+      },
+      url: 'redis://localhost:6379',
+    });
+
+    await provider.disconnect();
+  });
+
   it('normalizes set options into ioredis arguments', async () => {
     const { mocks, provider } = await createMockedProvider();
     await provider.set('key', 'value', { ex: 10, nx: true, get: true });
@@ -179,6 +201,17 @@ describe('mocked', () => {
 
     expect(mocks.eval).toHaveBeenCalledWith('return redis.call("GET", KEYS[1])', 1, 'my-key');
     expect(result).toBe(1);
+    await provider.disconnect();
+  });
+
+  it('forwards scan to ioredis', async () => {
+    const { mocks, provider } = await createMockedProvider();
+    mocks.scan.mockResolvedValue(['0', ['workflow:run-guard:global']]);
+
+    const result = await provider.scan('0', 'MATCH', 'workflow:run-guard:*', 'COUNT', 100);
+
+    expect(mocks.scan).toHaveBeenCalledWith('0', 'MATCH', 'workflow:run-guard:*', 'COUNT', 100);
+    expect(result).toEqual(['0', ['workflow:run-guard:global']]);
     await provider.disconnect();
   });
 

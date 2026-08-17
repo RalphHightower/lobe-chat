@@ -10,16 +10,16 @@ import { useSendMenuItems } from './useSendMenuItems';
 
 const leftActions: ActionKeys[] = [
   'model',
+  'effort',
   'search',
   'memory',
   'fileUpload',
   'tools',
   '---',
   ['typo', 'params', 'clear'],
-  'mainToken',
 ];
 
-const rightActions: ActionKeys[] = [];
+const rightActions: ActionKeys[] = ['voiceMessage', 'contextWindow'];
 
 /**
  * MainChatInput

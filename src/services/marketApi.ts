@@ -7,8 +7,7 @@ import {
 import { lambdaClient } from '@/libs/trpc/client';
 import { discoverService } from '@/services/discover';
 import {
-  type AgentForkRequest,
-  type AgentForkResponse,
+  type AgentForkBatchInput,
   type AgentForkSourceResponse,
   type AgentForksResponse,
   type AgentGroupForkRequest,
@@ -24,17 +23,9 @@ interface GetOwnAgentsParams {
 }
 
 export class MarketApiService {
-  /**
-   * @deprecated This method is no longer needed as authentication is now handled
-   * automatically through tRPC middleware. Keeping for backward compatibility.
-   */
-
-  setAccessToken(_token: string) {
-    // No-op: Authentication is now handled through tRPC authedProcedure middleware
-  }
-
   // Create new agent
   async createAgent(agentData: {
+    actAs?: number;
     homepage?: string;
     identifier: string;
     isFeatured?: boolean;
@@ -67,6 +58,7 @@ export class MarketApiService {
 
   // Create agent version
   async createAgentVersion(versionData: {
+    actAs?: number;
     a2aProtocolVersion?: string;
     avatar?: string;
     category?: string;
@@ -96,16 +88,6 @@ export class MarketApiService {
     return lambdaClient.market.agent.createAgentVersion.mutate(versionData);
   }
 
-  // Publish agent (make it visible in marketplace)
-  async publishAgent(identifier: string): Promise<void> {
-    await lambdaClient.market.agent.publishAgent.mutate({ identifier });
-  }
-
-  // Unpublish agent (hide from marketplace, can be republished)
-  async unpublishAgent(identifier: string): Promise<void> {
-    await lambdaClient.market.agent.unpublishAgent.mutate({ identifier });
-  }
-
   // Deprecate agent (permanently hide, cannot be republished)
   async deprecateAgent(identifier: string): Promise<void> {
     await lambdaClient.market.agent.deprecateAgent.mutate({ identifier });
@@ -119,17 +101,14 @@ export class MarketApiService {
   // ==================== Fork Agent API ====================
 
   /**
-   * Fork an agent
-   * @param sourceIdentifier - Source agent identifier
-   * @param forkData - Fork request parameters
+   * Fork one or more agents in a single batch.
+   *
+   * Best-effort: each item is reported individually with `success` true or
+   * false. A failed item does not abort the rest of the batch.
    */
-  async forkAgent(
-    sourceIdentifier: string,
-    forkData: AgentForkRequest,
-  ): Promise<AgentForkResponse> {
+  async forkAgent(items: AgentForkBatchInput[]) {
     return lambdaClient.market.agent.forkAgent.mutate({
-      sourceIdentifier,
-      ...forkData,
+      items,
     });
   }
 
@@ -157,14 +136,6 @@ export class MarketApiService {
     return lambdaClient.market.agentGroup.getAgentGroupDetail.query({
       identifier,
     }) as Promise<any>;
-  }
-
-  async publishAgentGroup(identifier: string): Promise<void> {
-    await lambdaClient.market.agentGroup.publishAgentGroup.mutate({ identifier });
-  }
-
-  async unpublishAgentGroup(identifier: string): Promise<void> {
-    await lambdaClient.market.agentGroup.unpublishAgentGroup.mutate({ identifier });
   }
 
   async deprecateAgentGroup(identifier: string): Promise<void> {

@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { DevTools } from '@vitejs/devtools';
 import type { PluginOption, ViteDevServer } from 'vite';
 import { defineConfig, loadEnv } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
@@ -9,19 +10,28 @@ import { VitePWA } from 'vite-plugin-pwa';
 import { viteEnvRestartKeys } from './plugins/vite/envRestartKeys';
 import {
   createSharedRolldownOutput,
+  sharedModulePreload,
   sharedOptimizeDeps,
+  sharedPwaGlobIgnores,
+  sharedPwaRuntimeCaching,
+  sharedRendererDedupe,
   sharedRendererDefine,
   sharedRendererPlugins,
 } from './plugins/vite/sharedRendererConfig';
 import { vercelSkewProtection } from './plugins/vite/vercelSkewProtection';
+import { createViteWatchOptions } from './plugins/vite/watchOptions';
 
 const isMobile = process.env.MOBILE === 'true';
+const isAuth = process.env.AUTH === 'true';
+const isWorkbench = process.env.SPA_TARGET === 'workbench';
 const mode = process.env.NODE_ENV === 'production' ? 'production' : 'development';
 
 Object.assign(process.env, loadEnv(mode, process.cwd(), ''));
 
 const isDev = process.env.NODE_ENV !== 'production';
-const platform = isMobile ? 'mobile' : 'web';
+const isMobileRuntime = isMobile || isWorkbench;
+const platform = isAuth ? 'auth' : isMobileRuntime ? 'mobile' : 'web';
+const enableViteDevTools = process.env.LOBE_VITE_DEVTOOLS === 'true';
 
 const resolveCommandExecutable = (cmd: string) => {
   const pathValue = process.env.PATH;
@@ -98,26 +108,74 @@ const openExternalBrowser = async (
 };
 
 export default defineConfig({
-  base: isDev ? '/' : process.env.VITE_CDN_BASE || '/_spa/',
+  base: isDev
+    ? '/'
+    : process.env.VITE_CDN_BASE ||
+      (isAuth ? '/_spa-auth/' : isWorkbench ? '/_spa-workbench/' : '/_spa/'),
   build: {
-    outDir: isMobile ? 'dist/mobile' : 'dist/desktop',
+    modulePreload: sharedModulePreload,
+    outDir: isAuth
+      ? 'dist/auth'
+      : isWorkbench
+        ? 'dist/workbench'
+        : isMobile
+          ? 'dist/mobile'
+          : 'dist/desktop',
     reportCompressedSize: false,
     rolldownOptions: {
-      input: path.resolve(__dirname, isMobile ? 'index.mobile.html' : 'index.html'),
+      ...(enableViteDevTools && { devtools: {} }),
+      input: path.resolve(
+        __dirname,
+        isAuth
+          ? 'index.auth.html'
+          : isWorkbench
+            ? 'index.workbench.html'
+            : isMobile
+              ? 'index.mobile.html'
+              : 'index.html',
+      ),
       output: createSharedRolldownOutput({ strictExecutionOrder: true }),
     },
   },
-  define: sharedRendererDefine({ isMobile, isElectron: false }),
+  define: {
+    ...sharedRendererDefine({ isMobile: isMobileRuntime, isElectron: false }),
+    __WORKBENCH__: JSON.stringify(isWorkbench),
+  },
   experimental: {
-    bundledDev: true,
+    bundledDev: false,
   },
   resolve: {
+    dedupe: sharedRendererDedupe,
     tsconfigPaths: true,
   },
   optimizeDeps: sharedOptimizeDeps,
   plugins: [
+    isMobileRuntime &&
+      isDev && {
+        name: 'mobile-runtime-html-dev-entry',
+        enforce: 'pre' as const,
+        configureServer(server: ViteDevServer) {
+          server.middlewares.use((req, _res, next) => {
+            const raw = req.url;
+            if (!raw) return next();
+            const q = raw.indexOf('?');
+            const pathOnly = q === -1 ? raw : raw.slice(0, q);
+            const search = q === -1 ? '' : raw.slice(q);
+            if (pathOnly === '/' || pathOnly === '/index.html') {
+              req.url = `/${isWorkbench ? 'index.workbench.html' : 'index.mobile.html'}${search}`;
+            }
+            next();
+          });
+        },
+      },
     vercelSkewProtection(),
     viteEnvRestartKeys(['APP_URL']),
+    enableViteDevTools &&
+      DevTools({
+        build: {
+          withApp: true,
+        },
+      }),
     ...sharedRendererPlugins({ platform }),
 
     isDev && {
@@ -239,52 +297,66 @@ export default defineConfig({
       },
     },
 
-    VitePWA({
-      injectRegister: null,
-      manifest: false,
-      registerType: 'prompt',
-      workbox: {
-        globPatterns: ['**/*.{js,css,html,woff2}'],
-        maximumFileSizeToCacheInBytes: 10 * 1024 * 1024,
-        runtimeCaching: [
-          {
-            handler: 'StaleWhileRevalidate',
-            options: { cacheName: 'google-fonts-stylesheets' },
-            urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
-          },
-          {
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'google-fonts-webfonts',
-              expiration: { maxAgeSeconds: 60 * 60 * 24 * 365, maxEntries: 30 },
+    !isAuth &&
+      !isWorkbench &&
+      VitePWA({
+        injectRegister: null,
+        manifest: false,
+        registerType: 'prompt',
+        workbox: {
+          globIgnores: sharedPwaGlobIgnores,
+          globPatterns: ['**/*.{js,css,html,woff2}'],
+          maximumFileSizeToCacheInBytes: 10 * 1024 * 1024,
+          runtimeCaching: [
+            ...sharedPwaRuntimeCaching,
+            {
+              handler: 'StaleWhileRevalidate',
+              options: { cacheName: 'google-fonts-stylesheets' },
+              urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
             },
-            urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*/i,
-          },
-          {
-            handler: 'StaleWhileRevalidate',
-            options: {
-              cacheName: 'image-assets',
-              expiration: { maxAgeSeconds: 60 * 60 * 24 * 30, maxEntries: 100 },
+            {
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'google-fonts-webfonts',
+                expiration: { maxAgeSeconds: 60 * 60 * 24 * 365, maxEntries: 30 },
+              },
+              urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*/i,
             },
-            urlPattern: /\.(?:png|jpg|jpeg|svg|gif|webp|ico|avif)$/i,
-          },
-          {
-            handler: 'NetworkFirst',
-            options: {
-              cacheName: 'api-cache',
-              expiration: { maxAgeSeconds: 60 * 5, maxEntries: 50 },
+            {
+              handler: 'StaleWhileRevalidate',
+              options: {
+                cacheName: 'image-assets',
+                expiration: { maxAgeSeconds: 60 * 60 * 24 * 30, maxEntries: 100 },
+              },
+              urlPattern: /\.(?:png|jpg|jpeg|svg|gif|webp|ico|avif)$/i,
             },
-            urlPattern: /\/(api|trpc)\/.*/i,
-          },
-        ],
-      },
-    }),
+            {
+              handler: 'NetworkFirst',
+              options: {
+                cacheName: 'api-cache',
+                expiration: { maxAgeSeconds: 60 * 5, maxEntries: 50 },
+              },
+              urlPattern: /\/(api|trpc)\/.*/i,
+            },
+          ],
+        },
+      }),
   ].filter(Boolean) as PluginOption[],
 
   server: {
     cors: true,
     host: true,
-    port: 9876,
+    port: isWorkbench
+      ? Number(process.env.WORKBENCH_SPA_PORT) || 3014
+      : isMobile
+        ? Number(process.env.MOBILE_SPA_PORT) || 3012
+        : isAuth
+          ? Number(process.env.AUTH_SPA_PORT) || 3013
+          : Number(process.env.SPA_PORT) || 9876,
+    // The dev orchestrator (scripts/devStartupSequence.mts) pre-resolves a free
+    // port and injects it via env; never silently drift to another port, since
+    // downstream consumers locate this server through that env contract.
+    strictPort: true,
     proxy: {
       '/api': `http://localhost:${process.env.PORT || 3010}`,
       '/oidc': `http://localhost:${process.env.PORT || 3010}`,
@@ -298,15 +370,12 @@ export default defineConfig({
         './src/spa/**/*.tsx',
         './src/business/**/*.{ts,tsx}',
         './src/components/**/*.{ts,tsx}',
-        './src/config/**/*.ts',
         './src/const/**/*.ts',
-        './src/envs/**/*.ts',
         './src/features/**/*.{ts,tsx}',
         './src/helpers/**/*.ts',
         './src/hooks/**/*.{ts,tsx}',
         './src/layout/**/*.{ts,tsx}',
         './src/libs/**/*.{ts,tsx}',
-        './src/locales/**/*.ts',
         './src/routes/**/*.{ts,tsx}',
         './src/services/**/*.ts',
         './src/store/**/*.{ts,tsx}',
@@ -329,14 +398,20 @@ export default defineConfig({
         './packages/builtin-tool-*/src/**/*.ts',
         './packages/builtin-tools/src/**/*.ts',
         './packages/business/*/src/**/*.ts',
+        './packages/business-server/src/**/*.ts',
         './packages/config/src/**/*.ts',
         './packages/edge-config/src/**/*.ts',
         './packages/editor-runtime/src/**/*.ts',
+        './packages/env/src/**/*.ts',
+        './packages/trpc/src/**/*.{ts,tsx}',
+        './packages/app-config/src/**/*.ts',
+        './packages/locales/src/**/*.ts',
         './packages/fetch-sse/src/**/*.ts',
         './packages/desktop-bridge/src/**/*.ts',
         './packages/python-interpreter/src/**/*.ts',
         './packages/agent-manager-runtime/src/**/*.ts',
       ],
     },
+    watch: createViteWatchOptions([__dirname]),
   },
 });

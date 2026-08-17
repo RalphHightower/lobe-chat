@@ -2,16 +2,10 @@ import type { CredType } from '@lobechat/types';
 
 export const CredsApiName = {
   /**
-   * Connect a Klavis integration service via OAuth
-   * Initiates Klavis OAuth flow for third-party services like Notion, Gmail, etc.
+   * Connect a Composio integration service via OAuth
+   * Initiates Composio OAuth flow for third-party services like Gmail, Google Calendar, etc.
    */
-  connectKlavisService: 'connectKlavisService',
-
-  /**
-   * Get plaintext value of a credential
-   * Use when AI needs to access credential value for API calls
-   */
-  getPlaintextCred: 'getPlaintextCred',
+  connectComposioService: 'connectComposioService',
 
   /**
    * Initiate OAuth connection flow
@@ -34,24 +28,25 @@ export const CredsApiName = {
 
 export type CredsApiNameType = (typeof CredsApiName)[keyof typeof CredsApiName];
 
-// ==================== Tool Parameter Types ====================
+export const LOBEHUB_OAUTH_PROVIDER_IDS = [
+  'github',
+  'linear',
+  'microsoft',
+  'notion',
+  'twitter',
+] as const;
 
-export interface GetPlaintextCredParams {
-  /**
-   * The unique key of the credential to retrieve
-   */
-  key: string;
-  /**
-   * Reason for accessing this credential (for audit purposes)
-   */
-  reason?: string;
-}
+export const LOBEHUB_OAUTH_PROVIDER_LIST = LOBEHUB_OAUTH_PROVIDER_IDS.join(', ');
+
+export type LobehubOAuthProviderId = (typeof LOBEHUB_OAUTH_PROVIDER_IDS)[number];
+
+// ==================== Tool Parameter Types ====================
 
 export interface InitiateOAuthConnectParams {
   /**
-   * The OAuth provider ID (e.g., 'linear', 'microsoft', 'twitter')
+   * The OAuth provider ID (e.g., 'linear', 'microsoft', 'notion', 'twitter')
    */
-  provider: string;
+  provider: LobehubOAuthProviderId;
 }
 
 export interface InitiateOAuthConnectState {
@@ -71,17 +66,6 @@ export interface InitiateOAuthConnectState {
    * Provider display name
    */
   providerName: string;
-}
-
-export interface GetPlaintextCredState {
-  /**
-   * The credential key
-   */
-  key: string;
-  /**
-   * The plaintext values (key-value pairs)
-   */
-  values?: Record<string, string>;
 }
 
 export interface InjectCredsToSandboxParams {
@@ -144,16 +128,16 @@ export interface SaveCredsState {
   success: boolean;
 }
 
-// ==================== Klavis Service Types ====================
+// ==================== Composio Service Types ====================
 
-export interface ConnectKlavisServiceParams {
+export interface ConnectComposioServiceParams {
   /**
-   * The Klavis service identifier to connect (e.g., 'notion', 'gmail', 'google-calendar')
+   * The Composio service identifier to connect (e.g., 'gmail', 'google-calendar')
    */
   service: string;
 }
 
-export interface ConnectKlavisServiceState {
+export interface ConnectComposioServiceState {
   /**
    * Whether the service is now connected
    */
@@ -163,9 +147,9 @@ export interface ConnectKlavisServiceState {
    */
   identifier: string;
   /**
-   * OAuth URL (only present when authorization is needed)
+   * OAuth redirect URL (only present when authorization is needed)
    */
-  oauthUrl?: string;
+  redirectUrl?: string;
   /**
    * The service display name
    */

@@ -2,8 +2,8 @@ export const systemPrompt = `You have access to an Agent Documents tool for crea
 
 <core_capabilities>
 1. Create document (createDocument) - equivalent to touch/create with content
-2. Read document (readDocument) - equivalent to cat/read
-3. Edit document (editDocument) - full-content overwrite
+2. Read document (readDocument) - equivalent to cat/read; only one read entry, by document ID
+3. Replace document content (replaceDocumentContent) - full-content overwrite by ID
 4. Modify nodes (modifyNodes) - apply precise LiteXML insert/modify/remove operations
 5. Remove document (removeDocument) - equivalent to rm/delete
 6. Rename document (renameDocument) - equivalent to mv/rename
@@ -14,18 +14,21 @@ export const systemPrompt = `You have access to an Agent Documents tool for crea
 <workflow>
 1. Understand the exact document operation intent.
 2. Select the correct API based on the requested action.
-3. Use explicit IDs/titles/content in arguments.
+3. Use explicit IDs and content in arguments. Read documents by ID; if you only know the filename, listDocuments first to resolve it.
 4. If operation depends on existing content, read before writing/deleting.
 5. Confirm what changed after each operation.
 </workflow>
 
 <tool_selection_guidelines>
 - By default, if the user does not explicitly specify otherwise, and the relevant Agent Documents tool is available for the task, prefer Agent Documents over Cloud Sandbox because it is easier for collaboration and multi-agent coordination.
-- **createDocument**: create a new document with title + content. Use target="currentTopic" only when the user asks to create a document in the current topic; otherwise omit target for an agent-scoped document.
-- **listDocuments**: list agent documents. Use target="currentTopic" when the user asks about documents in the current topic.
-- **readDocument**: retrieve current content by document ID before making risky edits. Prefer format="xml" when you may edit content, because XML includes stable node IDs.
+- **createDocument**: create a new document with title + content. Use scope="currentTopic" only when the user asks to create a document in the current topic; otherwise omit scope for an agent-scoped document.
+- Set hintIsSkill=true only when creating a document that contains reusable procedural knowledge, workflow instructions, tool usage guidance, or durable agent behavior. Leave ordinary notes unhinted.
+- When the user asks to remember, save, or reuse a workflow, checklist, template, skill, or repeatable procedure for this agent or topic, prefer createDocument with hintIsSkill=true over user memory. This preserves scoped procedural knowledge without turning it into a global personal preference.
+- Do not create or maintain managed skills directly; Agent Signal decides whether hinted documents become skills.
+- **listDocuments**: list agent documents. Use scope="currentTopic" when the user asks about documents in the current topic. The default agent_documents_index hides web-crawled documents; pass sourceType="web" here to enumerate them, or sourceType="all" to see everything. The index also collapses folders into a single 📁 row — pass parentId=<folder id from that row> to expand a folder and see its documents. Use this to resolve a title to a document ID before reading. For read and mutation calls, pass the result's \`id\`. For folder navigation, pass the folder's \`documentId\` (or the ID shown in a collapsed folder row) as \`listDocuments.parentId\`.
+- **readDocument**: retrieve current content by agent document ID. Pass the \`id\` field returned by listDocuments, not \`documentId\`. This is the only way to read an agent document — there is no read-by-filename variant. Prefer format="xml" when you may edit content, because XML includes stable node IDs. If the response contains empty content, the document is genuinely empty; do not retry with a different format or filename.
 - **modifyNodes**: preferred content-edit API. Use LiteXML insert/modify/remove operations after reading XML. For modify operations, include the existing node ID in the LiteXML.
-- **editDocument**: overwrite the full content of an existing document only when replacing most or all content.
+- **replaceDocumentContent**: overwrite the full content of an existing document only when replacing most or all content.
 - **removeDocument**: permanently remove a document by ID.
 - **renameDocument**: change document title only.
 - **copyDocument**: duplicate a document, optionally with a new title.
@@ -43,7 +46,8 @@ export const systemPrompt = `You have access to an Agent Documents tool for crea
 <response_format>
 When using this tool:
 1. Confirm the action taken.
-2. Include key identifiers (document ID/title) in the response.
-3. Clearly explain if something is not found or if an operation failed.
+2. When a document is created or updated and the tool result includes a document link (URL), always present it to the user as a clickable markdown link, e.g. [document title](url). This is the primary way the user opens the document.
+3. Never expose the internal document ID to the user. It exists only for your own subsequent read/edit/remove calls; surfacing a raw ID to the user is not actionable for them.
+4. Clearly explain if something is not found or if an operation failed.
 </response_format>
 `;

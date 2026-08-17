@@ -1,13 +1,35 @@
 import { describe, expect, it } from 'vitest';
 
-import { ClaudeCodeAdapter, CodexAdapter } from './adapters';
-import { createAdapter, getPreset, listAgentTypes } from './registry';
+import {
+  AmpAdapter,
+  ClaudeCodeAdapter,
+  CodeBuddyAdapter,
+  CodexAdapter,
+  CursorAdapter,
+  GrokBuildAdapter,
+  KimiCodeAdapter,
+  OpenCodeAdapter,
+  PiAdapter,
+  QoderAdapter,
+  TraeAcpAdapter,
+} from './adapters';
+import { HETEROGENEOUS_AGENT_CONFIGS } from './config';
+import { createAdapter, listAgentTypes, listLocalAgentTypes } from './registry';
 
 describe('registry', () => {
   describe('createAdapter', () => {
+    it('creates an AmpAdapter for "amp"', () => {
+      const adapter = createAdapter('amp');
+      expect(adapter).toBeInstanceOf(AmpAdapter);
+    });
+
     it('creates a ClaudeCodeAdapter for "claude-code"', () => {
       const adapter = createAdapter('claude-code');
       expect(adapter).toBeInstanceOf(ClaudeCodeAdapter);
+    });
+
+    it('creates a CodeBuddyAdapter for "codebuddy"', () => {
+      expect(createAdapter('codebuddy')).toBeInstanceOf(CodeBuddyAdapter);
     });
 
     it('creates a CodexAdapter for "codex"', () => {
@@ -15,46 +37,45 @@ describe('registry', () => {
       expect(adapter).toBeInstanceOf(CodexAdapter);
     });
 
+    it('creates a KimiCodeAdapter for "kimi-code"', () => {
+      expect(createAdapter('kimi-code')).toBeInstanceOf(KimiCodeAdapter);
+    });
+
+    it('creates a CursorAdapter for "cursor"', () => {
+      expect(createAdapter('cursor')).toBeInstanceOf(CursorAdapter);
+    });
+
+    it('creates a GrokBuildAdapter for "grok-build"', () => {
+      expect(createAdapter('grok-build')).toBeInstanceOf(GrokBuildAdapter);
+    });
+
+    it('creates an OpenCodeAdapter for "opencode"', () => {
+      expect(createAdapter('opencode')).toBeInstanceOf(OpenCodeAdapter);
+    });
+
+    it('creates a PiAdapter for "pi"', () => {
+      expect(createAdapter('pi')).toBeInstanceOf(PiAdapter);
+    });
+
+    it('creates a QoderAdapter for "qoder"', () => {
+      expect(createAdapter('qoder')).toBeInstanceOf(QoderAdapter);
+    });
+
+    it('creates a TraeAcpAdapter for "trae"', () => {
+      expect(createAdapter('trae')).toBeInstanceOf(TraeAcpAdapter);
+    });
+
     it('throws for unknown agent type', () => {
       expect(() => createAdapter('unknown-agent')).toThrow('Unknown agent type: "unknown-agent"');
     });
   });
 
-  describe('getPreset', () => {
-    it('returns preset with stream-json args for claude-code', () => {
-      const preset = getPreset('claude-code');
-      expect(preset.baseArgs).toContain('--input-format');
-      expect(preset.baseArgs).toContain('--output-format');
-      expect(preset.baseArgs).toContain('stream-json');
-      expect(preset.baseArgs).toContain('-p');
-      expect(preset.promptMode).toBe('stdin');
-    });
-
-    it('preset has resumeArgs function', () => {
-      const preset = getPreset('claude-code');
-      expect(preset.resumeArgs).toBeDefined();
-      const args = preset.resumeArgs!('sess_abc');
-      expect(args).toContain('--resume');
-      expect(args).toContain('sess_abc');
-    });
-
-    it('returns preset with exec args for codex', () => {
-      const preset = getPreset('codex');
-      expect(preset.baseArgs).toContain('exec');
-      expect(preset.baseArgs).toContain('--json');
-      expect(preset.promptMode).toBe('stdin');
-    });
-
-    it('throws for unknown agent type', () => {
-      expect(() => getPreset('nope')).toThrow('Unknown agent type: "nope"');
-    });
-  });
-
   describe('listAgentTypes', () => {
-    it('includes claude-code', () => {
-      const types = listAgentTypes();
-      expect(types).toContain('claude-code');
-      expect(types).toContain('codex');
+    it('registers exactly one local adapter for every descriptor', () => {
+      expect(listLocalAgentTypes().toSorted()).toEqual(
+        HETEROGENEOUS_AGENT_CONFIGS.map(({ type }) => type).toSorted(),
+      );
+      expect(listAgentTypes()).toContain('claude-code-sdk');
     });
   });
 });

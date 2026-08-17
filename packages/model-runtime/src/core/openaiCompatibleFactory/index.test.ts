@@ -8,7 +8,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LobeOpenAICompatibleRuntime } from '../../core/BaseAI';
 import type { ChatStreamCallbacks, ChatStreamPayload } from '../../types/chat';
 import { AgentRuntimeErrorType } from '../../types/error';
+import type { ModelRuntimeDiagnostics } from '../../types/providerDiagnostics';
 import * as debugStreamModule from '../../utils/debugStream';
+import {
+  createSignatureChannelId,
+  createSignatureScope,
+  serializeScopedSignature,
+} from '../../utils/signatureScope';
 import * as openaiHelpers from '../contextBuilders/openai';
 import { createOpenAICompatibleRuntime } from './index';
 
@@ -22,8 +28,55 @@ const defaultBaseURL = 'https://api.groq.com/openai/v1';
 const bizErrorType = 'ProviderBizError';
 const invalidErrorType = 'InvalidProviderAPIKey';
 
+const createOpenAIThoughtSignatureScope = async ({
+  apiKey = 'test',
+  baseURL = defaultBaseURL,
+  model = 'upstream-model',
+  scopeProvider = 'mapped-provider',
+}: {
+  apiKey?: string;
+  baseURL?: string;
+  model?: string;
+  scopeProvider?: string;
+} = {}) =>
+  createSignatureScope({
+    kind: 'thought_signature',
+    model,
+    protocol: 'chat_completions',
+    source: {
+      apiType: 'openai',
+      channelId: await createSignatureChannelId(baseURL, apiKey),
+      provider: scopeProvider,
+    },
+  });
+
+const createOpenAIReasoningSignatureScope = async ({
+  apiKey = 'test',
+  baseURL = 'https://api.test.com/v1',
+  model = 'upstream-model',
+  scopeProvider = 'mapped-provider',
+}: {
+  apiKey?: string;
+  baseURL?: string;
+  model?: string;
+  scopeProvider?: string;
+} = {}) =>
+  createSignatureScope({
+    kind: 'reasoning',
+    model,
+    protocol: 'responses',
+    source: {
+      apiType: 'openai',
+      channelId: await createSignatureChannelId(baseURL, apiKey),
+      provider: scopeProvider,
+    },
+  });
+
 // Mock the console.error to avoid polluting test output
 vi.spyOn(console, 'error').mockImplementation(() => {});
+vi.mock('@lobechat/business-model-bank/model-config', () => ({
+  loadModels: vi.fn().mockResolvedValue([]),
+}));
 
 let instance: LobeOpenAICompatibleRuntime;
 
@@ -53,6 +106,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.clearAllMocks();
+  vi.useRealTimers();
 });
 
 describe('LobeOpenAICompatibleFactory', () => {
@@ -77,6 +131,227 @@ describe('LobeOpenAICompatibleFactory', () => {
   });
 
   describe('chat', () => {
+    it('should retain the exact OpenAI Chat Completions request and raw chunks', async () => {
+      const rawEvents: OpenAI.Chat.Completions.ChatCompletionChunk[] = [
+        {
+          choices: [
+            {
+              delta: { content: '', role: 'assistant' },
+              finish_reason: null,
+              index: 0,
+              logprobs: null,
+            },
+          ],
+          created: 1_785_670_000,
+          id: 'chatcmpl_empty',
+          model: 'glm-5.2',
+          object: 'chat.completion.chunk',
+        },
+        {
+          choices: [
+            {
+              delta: {},
+              finish_reason: 'stop',
+              index: 0,
+              logprobs: null,
+            },
+          ],
+          created: 1_785_670_001,
+          id: 'chatcmpl_empty',
+          model: 'glm-5.2',
+          object: 'chat.completion.chunk',
+          usage: { completion_tokens: 1, prompt_tokens: 100, total_tokens: 101 },
+        },
+      ];
+      const rawResponseBody = rawEvents
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join('');
+      const rawStream = {
+        async *[Symbol.asyncIterator]() {
+          for (const event of rawEvents) yield event;
+        },
+      };
+      const create = vi.fn(() => ({
+        withResponse: vi.fn().mockResolvedValue({
+          data: rawStream,
+          request_id: 'req_openai_empty',
+          response: new Response(rawResponseBody, {
+            headers: {
+              'cf-ray': 'ray-openai',
+              'content-type': 'text/event-stream',
+              'x-request-id': 'req-header-openai',
+            },
+            status: 200,
+          }),
+        }),
+      }));
+      const Runtime = createOpenAICompatibleRuntime({
+        baseURL: 'https://api.test.com/v1',
+        customClient: {
+          createClient: () => ({ chat: { completions: { create } } }) as unknown as OpenAI,
+        },
+        provider: 'test-provider',
+      });
+      const runtime = new Runtime({ apiKey: 'test' });
+      const diagnostics: ModelRuntimeDiagnostics = {};
+
+      const response = await runtime.chat(
+        {
+          messages: [{ content: 'Question', role: 'user' }],
+          model: 'glm-5.2',
+          stream: true,
+        },
+        { diagnostics, user: 'user-1' },
+      );
+      await response.text();
+
+      expect(diagnostics.providerRequest).toEqual(
+        expect.objectContaining({
+          apiMode: 'chat_completions',
+          endpoint: 'https://api.***.com/v1',
+          payload: expect.objectContaining({
+            messages: [{ content: 'Question', role: 'user' }],
+            model: 'glm-5.2',
+            stream: true,
+            user: 'user-1',
+          }),
+          sentAt: expect.any(Number),
+        }),
+      );
+      expect(diagnostics.providerResponse).toEqual(
+        expect.objectContaining({
+          apiMode: 'chat_completions',
+          completedAt: expect.any(Number),
+          eventCount: 2,
+          headers: {
+            'cf-ray': 'ray-openai',
+            'content-type': 'text/event-stream',
+            'x-request-id': 'req-header-openai',
+          },
+          messageId: 'chatcmpl_empty',
+          model: 'glm-5.2',
+          rawEvents,
+          rawResponse: {
+            body: rawResponseBody,
+            byteLength: new TextEncoder().encode(rawResponseBody).byteLength,
+            status: 'captured',
+          },
+          requestId: 'req_openai_empty',
+          status: 200,
+          stopReason: 'stop',
+          terminalEventReceived: true,
+          textChars: 0,
+          usage: { completion_tokens: 1, prompt_tokens: 100, total_tokens: 101 },
+        }),
+      );
+    });
+
+    it('should retain the exact OpenAI Responses request and raw events', async () => {
+      const rawEvents = [
+        {
+          response: {
+            id: 'resp_empty',
+            model: 'gpt-5.4-mini',
+            status: 'in_progress',
+            usage: null,
+          },
+          sequence_number: 0,
+          type: 'response.created',
+        },
+        {
+          response: {
+            id: 'resp_empty',
+            model: 'gpt-5.4-mini',
+            output: [],
+            status: 'completed',
+            usage: { input_tokens: 100, output_tokens: 1, total_tokens: 101 },
+          },
+          sequence_number: 1,
+          type: 'response.completed',
+        },
+      ] as unknown as OpenAI.Responses.ResponseStreamEvent[];
+      const rawResponseBody = rawEvents
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join('');
+      const rawStream = {
+        async *[Symbol.asyncIterator]() {
+          for (const event of rawEvents) yield event;
+        },
+      };
+      const create = vi.fn(() => ({
+        withResponse: vi.fn().mockResolvedValue({
+          data: rawStream,
+          request_id: 'req_responses_empty',
+          response: new Response(rawResponseBody, {
+            headers: {
+              'content-type': 'text/event-stream',
+              'openai-request-id': 'req-responses-header',
+            },
+            status: 200,
+          }),
+        }),
+      }));
+      const Runtime = createOpenAICompatibleRuntime({
+        baseURL: 'https://api.test.com/v1',
+        chatCompletion: { useResponse: true },
+        customClient: {
+          createClient: () => ({ responses: { create } }) as unknown as OpenAI,
+        },
+        provider: 'test-provider',
+      });
+      const runtime = new Runtime({ apiKey: 'test' });
+      const diagnostics: ModelRuntimeDiagnostics = {};
+
+      const response = await runtime.chat(
+        {
+          messages: [{ content: 'Question', role: 'user' }],
+          model: 'gpt-5.4-mini',
+          stream: true,
+        },
+        { diagnostics, user: 'user-1' },
+      );
+      await response.text();
+
+      expect(diagnostics.providerRequest).toEqual(
+        expect.objectContaining({
+          apiMode: 'responses',
+          endpoint: 'https://api.***.com/v1',
+          payload: expect.objectContaining({
+            input: expect.any(Array),
+            model: 'gpt-5.4-mini',
+            safety_identifier: 'user-1',
+            store: false,
+            stream: true,
+          }),
+          sentAt: expect.any(Number),
+        }),
+      );
+      expect(diagnostics.providerResponse).toEqual(
+        expect.objectContaining({
+          apiMode: 'responses',
+          completedAt: expect.any(Number),
+          eventCount: 2,
+          headers: {
+            'content-type': 'text/event-stream',
+            'openai-request-id': 'req-responses-header',
+          },
+          messageId: 'resp_empty',
+          model: 'gpt-5.4-mini',
+          rawEvents,
+          rawResponse: {
+            body: rawResponseBody,
+            byteLength: new TextEncoder().encode(rawResponseBody).byteLength,
+            status: 'captured',
+          },
+          requestId: 'req_responses_empty',
+          status: 200,
+          stopReason: 'completed',
+          terminalEventReceived: true,
+          usage: { input_tokens: 100, output_tokens: 1, total_tokens: 101 },
+        }),
+      );
+    });
+
     it('should return a Response on successful API call', async () => {
       // Arrange
       const mockStream = new ReadableStream();
@@ -127,6 +402,164 @@ describe('LobeOpenAICompatibleFactory', () => {
         { headers: { Accept: '*/*' } },
       );
       expect(result).toBeInstanceOf(Response);
+    });
+
+    // MCP tool schemas with `items: true` or array props missing
+    // `type` must be normalized before reaching the upstream validator.
+    it('should normalize tool parameter schemas before sending to upstream', async () => {
+      (instance['client'].chat.completions.create as Mock).mockResolvedValue(
+        Promise.resolve(new ReadableStream()),
+      );
+
+      await instance.chat({
+        messages: [{ content: 'Hello', role: 'user' }],
+        model: 'mistralai/mistral-7b-instruct:free',
+        temperature: 0.7,
+        tools: [
+          {
+            function: {
+              name: 'mcp_tool',
+              parameters: {
+                properties: {
+                  ids: { items: true, type: 'array' },
+                  sourceIds: { items: { type: 'string' } },
+                },
+                type: 'object',
+              },
+            },
+            type: 'function',
+          },
+        ],
+      });
+
+      const callArgs = (instance['client'].chat.completions.create as Mock).mock.calls[0][0];
+      const params = callArgs.tools[0].function.parameters;
+      // `items: true` collapsed to `{}`
+      expect(params.properties.ids.items).toEqual({});
+      // array prop missing `type` gets backfilled
+      expect(params.properties.sourceIds.type).toBe('array');
+    });
+
+    it('should keep logical model for provider payload handling while sending mapped model id', async () => {
+      const handlePayload = vi.fn(
+        (payload: ChatStreamPayload): OpenAI.ChatCompletionCreateParamsStreaming => ({
+          messages: payload.messages as OpenAI.ChatCompletionCreateParamsStreaming['messages'],
+          model: payload.model,
+          stream: true,
+        }),
+      );
+      const Runtime = createOpenAICompatibleRuntime({
+        baseURL: defaultBaseURL,
+        chatCompletion: { handlePayload },
+        provider: 'mapped-provider',
+      });
+      const runtime = new Runtime({
+        apiKey: 'test',
+        modelIdMapping: { 'logical-model': 'upstream-model' },
+      });
+      vi.spyOn(runtime['client'].chat.completions, 'create').mockResolvedValue(
+        new ReadableStream() as any,
+      );
+
+      await runtime.chat({
+        messages: [{ content: 'Hello', role: 'user' }],
+        model: 'logical-model',
+        temperature: 0,
+      });
+
+      expect(handlePayload).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'logical-model' }),
+        expect.anything(),
+      );
+      expect(runtime['client'].chat.completions.create).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'upstream-model' }),
+        expect.anything(),
+      );
+    });
+
+    it('should replay a thought signature scoped to the mapped upstream model', async () => {
+      const Runtime = createOpenAICompatibleRuntime({
+        baseURL: defaultBaseURL,
+        provider: 'mapped-provider',
+      });
+      const runtime = new Runtime({
+        apiKey: 'test',
+        modelIdMapping: { 'logical-model': 'upstream-model' },
+      });
+      const create = vi
+        .spyOn(runtime['client'].chat.completions, 'create')
+        .mockResolvedValue(new ReadableStream() as any);
+      const scope = await createOpenAIThoughtSignatureScope();
+
+      await runtime.chat({
+        messages: [
+          {
+            content: '',
+            role: 'assistant',
+            tool_calls: [
+              {
+                function: { arguments: '{}', name: 'search' },
+                id: 'call-1',
+                thoughtSignature: serializeScopedSignature(
+                  'upstream-signature',
+                  scope,
+                  'thought_signature',
+                ),
+                type: 'function',
+              },
+            ],
+          },
+        ],
+        model: 'logical-model',
+        temperature: 0,
+      });
+
+      const request = create.mock.calls[0][0];
+      expect(request.model).toBe('upstream-model');
+      expect((request.messages[0] as any).tool_calls[0].thoughtSignature).toBe(
+        'upstream-signature',
+      );
+    });
+
+    it.each([
+      { apiKey: 'another-key', baseURL: defaultBaseURL, label: 'credential' },
+      { apiKey: 'test', baseURL: 'https://another.example.com/v1', label: 'endpoint' },
+    ])('should reject a thought signature from another direct $label', async (source) => {
+      const Runtime = createOpenAICompatibleRuntime({
+        baseURL: defaultBaseURL,
+        provider: 'mapped-provider',
+      });
+      const runtime = new Runtime({ apiKey: 'test' });
+      const create = vi
+        .spyOn(runtime['client'].chat.completions, 'create')
+        .mockResolvedValue(new ReadableStream() as any);
+      const sourceScope = await createOpenAIThoughtSignatureScope(source);
+
+      await runtime.chat({
+        messages: [
+          {
+            content: '',
+            role: 'assistant',
+            tool_calls: [
+              {
+                function: { arguments: '{}', name: 'search' },
+                id: 'call-1',
+                thoughtSignature: serializeScopedSignature(
+                  'foreign-signature',
+                  sourceScope,
+                  'thought_signature',
+                ),
+                type: 'function',
+              },
+            ],
+          },
+        ],
+        model: 'upstream-model',
+        temperature: 0,
+      });
+
+      const request = create.mock.calls[0][0];
+      expect((request.messages[0] as any).tool_calls[0].thoughtSignature).toBeUndefined();
     });
 
     describe('streaming response', () => {
@@ -424,7 +857,7 @@ describe('LobeOpenAICompatibleFactory', () => {
           'data: "Hello"\n\n',
           'id: a\n',
           'event: usage\n',
-          'data: {"inputTextTokens":5,"outputTextTokens":5,"totalInputTokens":5,"totalOutputTokens":5,"totalTokens":10,"cost":0.000005}\n\n',
+          'data: {"inputTextTokens":5,"outputTextTokens":5,"totalInputTokens":5,"totalOutputTokens":5,"totalTokens":10}\n\n',
           'id: output_speed\n',
           'event: speed\n',
           expect.stringMatching(/^data: \{.*"tps":.*,"ttft":.*\}\n\n$/), // tps ttft should be calculated with elapsed time
@@ -456,6 +889,143 @@ describe('LobeOpenAICompatibleFactory', () => {
         expect(mockCreateMethod).toHaveBeenCalledWith(
           expect.objectContaining({
             user: 'abc',
+          }),
+          expect.anything(),
+        );
+      });
+
+      it('should add prompt_cache_key for OpenAI chat requests with user', async () => {
+        const LobeOpenAIProvider = createOpenAICompatibleRuntime({
+          baseURL: 'https://api.openai.com/v1',
+          provider: ModelProvider.OpenAI,
+        });
+
+        const instance = new LobeOpenAIProvider({ apiKey: 'test' });
+        const mockCreateMethod = vi
+          .spyOn(instance['client'].chat.completions, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+
+        await instance.chat(
+          {
+            messages: [{ content: 'Hello', role: 'user' }],
+            model: 'gpt-4o',
+            temperature: 0,
+          },
+          { user: 'testUser' },
+        );
+
+        expect(mockCreateMethod).toHaveBeenCalledWith(
+          expect.objectContaining({
+            prompt_cache_key: 'lobe:testUser:gpt-4o',
+          }),
+          expect.anything(),
+        );
+      });
+
+      it('should not add prompt_cache_key for non-GPT models', async () => {
+        const mockCreateMethod = vi.spyOn(instance['client'].chat.completions, 'create');
+
+        await instance.chat(
+          {
+            messages: [{ content: 'Hello', role: 'user' }],
+            model: 'llama-3.1-8b-instant',
+            temperature: 0,
+          },
+          { user: 'testUser' },
+        );
+
+        expect(mockCreateMethod).toHaveBeenCalledWith(
+          expect.not.objectContaining({
+            prompt_cache_key: expect.anything(),
+          }),
+          expect.anything(),
+        );
+      });
+
+      it('should not add prompt_cache_key for GPT chat requests without user', async () => {
+        const LobeOpenAIProvider = createOpenAICompatibleRuntime({
+          baseURL: 'https://api.openai.com/v1',
+          provider: ModelProvider.OpenAI,
+        });
+        const instance = new LobeOpenAIProvider({ apiKey: 'test' });
+        const mockCreateMethod = vi
+          .spyOn(instance['client'].chat.completions, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+
+        await instance.chat({
+          messages: [{ content: 'Hello', role: 'user' }],
+          model: 'gpt-4o',
+          temperature: 0,
+        });
+
+        expect(mockCreateMethod).toHaveBeenCalledWith(
+          expect.not.objectContaining({
+            prompt_cache_key: expect.anything(),
+          }),
+          expect.anything(),
+        );
+      });
+
+      it('should add prompt_cache_key for GPT models from any provider (including new-api/aihubmix)', async () => {
+        // Test with non-OpenAI provider but GPT model
+        const LobeCustomOpenAICompatibleProvider = createOpenAICompatibleRuntime({
+          baseURL: 'https://custom-proxy.new-api.com/v1',
+          provider: 'custom-openai-compatible',
+        });
+
+        const instance = new LobeCustomOpenAICompatibleProvider({ apiKey: 'test' });
+        const mockCreateMethod = vi
+          .spyOn(instance['client'].chat.completions, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+
+        await instance.chat(
+          {
+            messages: [{ content: 'Hello', role: 'user' }],
+            model: 'gpt-4o-mini',
+            temperature: 0,
+          },
+          { user: 'testUser' },
+        );
+
+        expect(mockCreateMethod).toHaveBeenCalledWith(
+          expect.objectContaining({
+            prompt_cache_key: 'lobe:testUser:gpt-4o-mini',
+          }),
+          expect.anything(),
+        );
+      });
+
+      it('should not override custom prompt_cache_key from handlePayload', async () => {
+        const LobeOpenAIProvider = createOpenAICompatibleRuntime({
+          baseURL: 'https://api.openai.com/v1',
+          chatCompletion: {
+            handlePayload: (payload) =>
+              ({
+                ...payload,
+                prompt_cache_key: 'custom-cache-key',
+                stream: true,
+              }) as OpenAI.ChatCompletionCreateParamsStreaming,
+          },
+          provider: ModelProvider.OpenAI,
+        });
+
+        const instance = new LobeOpenAIProvider({ apiKey: 'test' });
+        const mockCreateMethod = vi
+          .spyOn(instance['client'].chat.completions, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+
+        await instance.chat(
+          {
+            messages: [{ content: 'Hello', role: 'user' }],
+            model: 'gpt-4o',
+            temperature: 0,
+          },
+          { user: 'testUser' },
+        );
+
+        expect(mockCreateMethod).toHaveBeenCalledWith(
+          expect.objectContaining({
+            prompt_cache_key: 'custom-cache-key',
           }),
           expect.anything(),
         );
@@ -554,6 +1124,141 @@ describe('LobeOpenAICompatibleFactory', () => {
       });
     });
 
+    describe('contextPreFlight option', () => {
+      const tightModel: any = {
+        contextWindowTokens: 2000,
+        displayName: 'Tight',
+        id: 'tight-model',
+        maxOutput: 8000,
+        type: 'chat',
+      };
+      const roomyModel: any = {
+        contextWindowTokens: 200_000,
+        displayName: 'Roomy',
+        id: 'roomy-model',
+        maxOutput: 8000,
+        type: 'chat',
+      };
+
+      it('aborts before dispatch with ExceededContextWindow when prompt exceeds ctx', async () => {
+        const LobePreFlightProvider = createOpenAICompatibleRuntime({
+          baseURL: defaultBaseURL,
+          chatCompletion: {
+            contextPreFlight: { models: [tightModel] },
+          },
+          provider: 'preflight-test',
+        });
+
+        const instance = new LobePreFlightProvider({ apiKey: 'test' });
+        const mockCreateMethod = vi
+          .spyOn(instance['client'].chat.completions, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+
+        const longContent = 'a'.repeat(20_000);
+
+        try {
+          await instance.chat({
+            messages: [{ content: longContent, role: 'user' }],
+            model: 'tight-model',
+            temperature: 0,
+          });
+          expect.fail('expected chat to reject');
+        } catch (error) {
+          expect((error as any).errorType).toBe(AgentRuntimeErrorType.ExceededContextWindow);
+          expect((error as any).error.type).toBe('context_exceeded_pre_flight');
+          expect((error as any).error.model).toBe('tight-model');
+          expect((error as any).error.ctx).toBe(2000);
+          expect((error as any).error.promptTokens).toBeGreaterThan(0);
+          expect((error as any).error.shortBy).toBe(
+            (error as any).error.promptTokens - (error as any).error.ctx,
+          );
+          expect((error as any).error.suggestions).toEqual([
+            'fork_topic',
+            'switch_to_larger_ctx_model',
+          ]);
+        }
+
+        expect(mockCreateMethod).not.toHaveBeenCalled();
+      });
+
+      it('passes through when prompt fits comfortably', async () => {
+        const LobePreFlightProvider = createOpenAICompatibleRuntime({
+          baseURL: defaultBaseURL,
+          chatCompletion: {
+            contextPreFlight: { models: [roomyModel] },
+          },
+          provider: 'preflight-test',
+        });
+
+        const instance = new LobePreFlightProvider({ apiKey: 'test' });
+        const mockCreateMethod = vi
+          .spyOn(instance['client'].chat.completions, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+
+        await instance.chat({
+          messages: [{ content: 'hi', role: 'user' }],
+          model: 'roomy-model',
+          temperature: 0,
+        });
+
+        expect(mockCreateMethod).toHaveBeenCalledTimes(1);
+      });
+
+      it('skips when the model is unknown to the pre-flight list', async () => {
+        const LobePreFlightProvider = createOpenAICompatibleRuntime({
+          baseURL: defaultBaseURL,
+          chatCompletion: {
+            contextPreFlight: { models: [tightModel] },
+          },
+          provider: 'preflight-test',
+        });
+
+        const instance = new LobePreFlightProvider({ apiKey: 'test' });
+        const mockCreateMethod = vi
+          .spyOn(instance['client'].chat.completions, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+
+        const longContent = 'a'.repeat(20_000);
+        await instance.chat({
+          messages: [{ content: longContent, role: 'user' }],
+          model: 'unknown-model',
+          temperature: 0,
+        });
+
+        expect(mockCreateMethod).toHaveBeenCalledTimes(1);
+      });
+
+      it('passes through a near-limit prompt that still fits the window', async () => {
+        // Regression: prior implementation deducted a 1024 buffer + 1024
+        // minOutputTokens before deciding, which rejected a ~198.5k-token
+        // prompt against a 200k-token window. The corrected threshold
+        // only fires on real overflow.
+        const LobePreFlightProvider = createOpenAICompatibleRuntime({
+          baseURL: defaultBaseURL,
+          chatCompletion: {
+            contextPreFlight: { models: [roomyModel] },
+          },
+          provider: 'preflight-test',
+        });
+
+        const instance = new LobePreFlightProvider({ apiKey: 'test' });
+        const mockCreateMethod = vi
+          .spyOn(instance['client'].chat.completions, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+
+        // ~4 chars/token, so this estimates around 198.5k tokens.
+        const nearLimitContent = 'a'.repeat(794_000);
+
+        await instance.chat({
+          messages: [{ content: nearLimitContent, role: 'user' }],
+          model: 'roomy-model',
+          temperature: 0,
+        });
+
+        expect(mockCreateMethod).toHaveBeenCalledTimes(1);
+      });
+    });
+
     describe('cancel request', () => {
       it('should cancel ongoing request correctly', async () => {
         const controller = new AbortController();
@@ -614,7 +1319,7 @@ describe('LobeOpenAICompatibleFactory', () => {
             status: 400,
           },
           'Error message',
-          {},
+          new Headers(),
         );
 
         vi.spyOn(instance['client'].chat.completions, 'create').mockRejectedValue(apiError);
@@ -640,6 +1345,34 @@ describe('LobeOpenAICompatibleFactory', () => {
         }
       });
 
+      it('should classify media download failures as InvalidRequestFormat', async () => {
+        const apiError = new OpenAI.APIError(
+          400,
+          {
+            error: {
+              message: 'failed to download or process media content',
+              type: 'invalid_request_error',
+            },
+            status: 400,
+          },
+          'failed to download or process media content',
+          new Headers(),
+        );
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockRejectedValue(apiError);
+
+        await expect(
+          instance.chat({
+            messages: [{ content: 'Describe this image', role: 'user' }],
+            model: 'mimo-v2.5',
+            temperature: 0,
+          }),
+        ).rejects.toMatchObject({
+          errorType: AgentRuntimeErrorType.InvalidRequestFormat,
+          provider,
+        });
+      });
+
       it('should throw AgentRuntimeError with invalidErrorType if no apiKey is provided', async () => {
         try {
           new LobeMockProvider({});
@@ -655,7 +1388,7 @@ describe('LobeOpenAICompatibleFactory', () => {
             message: 'api is undefined',
           },
         };
-        const apiError = new OpenAI.APIError(400, errorInfo, 'module error', {});
+        const apiError = new OpenAI.APIError(400, errorInfo, 'module error', new Headers());
 
         vi.spyOn(instance['client'].chat.completions, 'create').mockRejectedValue(apiError);
 
@@ -684,7 +1417,7 @@ describe('LobeOpenAICompatibleFactory', () => {
         const errorInfo = {
           cause: { message: 'api is undefined' },
         };
-        const apiError = new OpenAI.APIError(400, errorInfo, 'module error', {});
+        const apiError = new OpenAI.APIError(400, errorInfo, 'module error', new Headers());
 
         instance = new LobeMockProvider({
           apiKey: 'test',
@@ -768,7 +1501,7 @@ describe('LobeOpenAICompatibleFactory', () => {
             status: 400,
           },
           'Error message',
-          {},
+          new Headers(),
         );
 
         vi.spyOn(instance['client'].chat.completions, 'create').mockRejectedValue(apiError);
@@ -804,7 +1537,7 @@ describe('LobeOpenAICompatibleFactory', () => {
             status: 400,
           },
           'Error message',
-          {},
+          new Headers(),
         );
 
         vi.spyOn(instance['client'].chat.completions, 'create').mockRejectedValue(apiError);
@@ -832,7 +1565,7 @@ describe('LobeOpenAICompatibleFactory', () => {
         }
       });
 
-      it('should detect QuotaLimitReached from error message text', async () => {
+      it('should detect RateLimitExceeded from error message text', async () => {
         const apiError = new OpenAI.APIError(
           429,
           {
@@ -842,7 +1575,7 @@ describe('LobeOpenAICompatibleFactory', () => {
             status: 429,
           },
           'Error message',
-          {},
+          new Headers(),
         );
 
         vi.spyOn(instance['client'].chat.completions, 'create').mockRejectedValue(apiError);
@@ -862,7 +1595,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               },
               status: 429,
             },
-            errorType: AgentRuntimeErrorType.QuotaLimitReached,
+            errorType: AgentRuntimeErrorType.RateLimitExceeded,
             message: expect.any(String),
             provider,
           });
@@ -1003,9 +1736,7 @@ describe('LobeOpenAICompatibleFactory', () => {
         },
       });
 
-      vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue({
-        tee: () => [mockStream, mockStream],
-      } as any);
+      vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(mockStream as any);
 
       const payload: ChatStreamPayload = {
         messages: [{ content: 'Test', role: 'user' }],
@@ -1128,7 +1859,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               model: 'any-model',
               temperature: 0,
             });
-          } catch (e) {
+          } catch {
             // Catch errors from incomplete mocking, we only care that responses.create was called
           }
 
@@ -1178,6 +1909,122 @@ describe('LobeOpenAICompatibleFactory', () => {
             strictToolPairing: true,
           }),
         );
+        convertSpy.mockRestore();
+      });
+
+      it('should replay encrypted reasoning scoped to the mapped upstream model', async () => {
+        const Runtime = createOpenAICompatibleRuntime({
+          baseURL: 'https://api.test.com/v1',
+          chatCompletion: { useResponse: true },
+          provider: 'mapped-provider',
+        });
+        const inst = new Runtime({
+          apiKey: 'test',
+          modelIdMapping: { 'logical-model': 'upstream-model' },
+        });
+        const create = vi
+          .spyOn(inst['client'].responses, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+        const scope = await createOpenAIReasoningSignatureScope();
+
+        await inst.chat({
+          messages: [
+            {
+              content: 'Answer',
+              reasoning: {
+                content: 'Summary',
+                signature: serializeScopedSignature(
+                  'upstream-encrypted-content',
+                  scope,
+                  'reasoning',
+                ),
+              },
+              role: 'assistant',
+            },
+          ],
+          model: 'logical-model',
+          temperature: 0,
+        });
+
+        const request = create.mock.calls[0][0];
+        expect(request.model).toBe('upstream-model');
+        expect(request.input?.[0]).toMatchObject({
+          encrypted_content: 'upstream-encrypted-content',
+          type: 'reasoning',
+        });
+      });
+
+      it('should bind encrypted reasoning to the ChatGPT subscription account', async () => {
+        const Runtime = createOpenAICompatibleRuntime({
+          baseURL: 'https://chatgpt.com/backend-api/codex',
+          chatCompletion: { useResponse: true },
+          provider: ModelProvider.ChatGPT,
+        });
+        const convertSpy = vi
+          .spyOn(openaiHelpers, 'convertOpenAIResponseInputs')
+          .mockRejectedValue({ status: 400 });
+
+        for (const chatgptAccountId of ['account-a', 'account-b']) {
+          const inst = new Runtime({ apiKey: 'oauth-token', chatgptAccountId });
+          await expect(
+            inst.chat({
+              messages: [{ content: 'hi', role: 'user' }],
+              model: 'gpt-5.6-sol',
+              temperature: 0,
+            }),
+          ).rejects.toBeDefined();
+        }
+
+        const fingerprints = convertSpy.mock.calls.map(
+          ([, options]) => options?.reasoningSignatureScope?.fingerprint,
+        );
+        expect(fingerprints[0]).toMatch(/^[\da-f]{32}$/);
+        expect(fingerprints[1]).toMatch(/^[\da-f]{32}$/);
+        expect(fingerprints[0]).not.toBe(fingerprints[1]);
+        expect(fingerprints).not.toContain('account-a');
+        expect(fingerprints).not.toContain('account-b');
+        convertSpy.mockRestore();
+      });
+
+      it('should keep OpenRouter OpenAI slugs on chat completions for provider payload normalization', async () => {
+        const LobeMockOpenRouter = createOpenAICompatibleRuntime({
+          baseURL: 'https://openrouter.ai/api/v1',
+          chatCompletion: {
+            handlePayload: (payload) => {
+              const { reasoning: _reasoning, thinking, ...rest } = payload;
+
+              return {
+                ...rest,
+                ...(thinking?.type === 'disabled' && { reasoning: { enabled: false } }),
+                stream: payload.stream ?? true,
+              } as any;
+            },
+          },
+          provider: ModelProvider.OpenRouter,
+        });
+
+        const inst = new LobeMockOpenRouter({ apiKey: 'test' });
+        const chatSpy = vi
+          .spyOn(inst['client'].chat.completions, 'create')
+          .mockResolvedValue(new ReadableStream() as any);
+        const responsesSpy = vi.spyOn(inst['client'].responses, 'create');
+
+        await inst.chat({
+          messages: [{ content: 'hi', role: 'user' }],
+          model: 'openai/gpt-5.2',
+          thinking: { type: 'disabled' },
+        });
+
+        expect(responsesSpy).not.toHaveBeenCalled();
+        expect(chatSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            model: 'openai/gpt-5.2',
+            reasoning: { enabled: false },
+            stream: true,
+          }),
+          expect.anything(),
+        );
+        expect(chatSpy.mock.calls[0][0]).not.toHaveProperty('thinking');
       });
 
       it(
@@ -1212,7 +2059,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               model: 'prefix-special-model-suffix',
               temperature: 0,
             });
-          } catch (e) {
+          } catch {
             // Catch errors from incomplete mocking
           }
           expect(spy).toHaveBeenCalledTimes(1);
@@ -1232,7 +2079,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               model: 'special-xyz',
               temperature: 0,
             });
-          } catch (e) {
+          } catch {
             // Catch errors from incomplete mocking
           }
           expect(spy).toHaveBeenCalledTimes(2);
@@ -1244,7 +2091,7 @@ describe('LobeOpenAICompatibleFactory', () => {
               model: 'unrelated-model',
               temperature: 0,
             });
-          } catch (e) {
+          } catch {
             // Catch errors
           }
           expect(spy).toHaveBeenCalledTimes(2); // Ensure no additional calls were made
@@ -1340,6 +2187,42 @@ describe('LobeOpenAICompatibleFactory', () => {
           imageUrl:
             'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
         });
+      });
+
+      it('should route mapped logical image-chat models through chat completions', async () => {
+        const mappedInstance = new LobeMockProvider({
+          apiKey: 'test',
+          modelIdMapping: { 'logical-image-model:image': 'upstream-image-model' },
+        });
+        vi.spyOn(mappedInstance['client'].chat.completions, 'create').mockResolvedValue({
+          choices: [
+            {
+              message: {
+                images: [
+                  {
+                    image_url: {
+                      url: 'data:image/png;base64,mapped-chat-image',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        } as any);
+        vi.spyOn(mappedInstance['client'].images, 'generate').mockResolvedValue({} as any);
+
+        const result = await (mappedInstance as any).createImage({
+          model: 'logical-image-model:image',
+          params: {
+            prompt: 'A beautiful sunset',
+          },
+        });
+
+        expect(mappedInstance['client'].chat.completions.create).toHaveBeenCalledWith(
+          expect.objectContaining({ model: 'upstream-image-model' }),
+        );
+        expect(mappedInstance['client'].images.generate).not.toHaveBeenCalled();
+        expect(result).toEqual({ imageUrl: 'data:image/png;base64,mapped-chat-image' });
       });
 
       it('should handle size auto parameter correctly', async () => {
@@ -1762,6 +2645,105 @@ describe('LobeOpenAICompatibleFactory', () => {
       expect(result).toEqual({ age: 30, name: 'John' });
     });
 
+    it('should choose generateObject API by logical model while sending mapped model id', async () => {
+      const Runtime = createOpenAICompatibleRuntime({
+        baseURL: defaultBaseURL,
+        generateObject: {
+          useResponseModels: ['logical-response-model'],
+        },
+        provider: 'mapped-provider',
+      });
+      const runtime = new Runtime({
+        apiKey: 'test',
+        modelIdMapping: { 'logical-response-model': 'upstream-response-model' },
+      });
+      vi.spyOn(runtime['client'].responses, 'create').mockResolvedValue({
+        output_text: '{"ok":true}',
+      } as any);
+      vi.spyOn(runtime['client'].chat.completions, 'create').mockResolvedValue({} as any);
+
+      const result = await runtime.generateObject({
+        messages: [{ content: 'Generate JSON', role: 'user' }],
+        model: 'logical-response-model',
+        schema: {
+          name: 'result',
+          schema: {
+            properties: { ok: { type: 'boolean' } },
+            type: 'object',
+          },
+        },
+      });
+
+      expect(runtime['client'].responses.create).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'upstream-response-model' }),
+        expect.anything(),
+      );
+      expect(runtime['client'].chat.completions.create).not.toHaveBeenCalled();
+      expect(result).toEqual({ ok: true });
+    });
+
+    it('should map disabled thinking to no reasoning effort for GPT-5.4 Responses generateObject', async () => {
+      const mockResponse = {
+        output_text: '{"name": "John", "age": 30}',
+      };
+
+      vi.spyOn(instance['client'].responses, 'create').mockResolvedValue(mockResponse as any);
+
+      const payload = {
+        messages: [{ content: 'Generate a person object', role: 'user' as const }],
+        model: 'gpt-5.4-mini',
+        schema: {
+          name: 'person_extractor',
+          schema: {
+            properties: { age: { type: 'number' }, name: { type: 'string' } },
+            type: 'object' as const,
+          },
+        },
+        thinking: { budget_tokens: 0, type: 'disabled' as const },
+      };
+
+      await instance.generateObject(payload);
+
+      expect(instance['client'].responses.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: 'gpt-5.4-mini',
+          reasoning: { effort: 'none' },
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('should normalize GPT-5 Pro-family Responses generateObject reasoning effort to high', async () => {
+      const mockResponse = {
+        output_text: '{"name": "John", "age": 30}',
+      };
+
+      vi.spyOn(instance['client'].responses, 'create').mockResolvedValue(mockResponse as any);
+
+      const payload = {
+        messages: [{ content: 'Generate a person object', role: 'user' as const }],
+        model: 'gpt-5.4-pro',
+        reasoning_effort: 'medium' as const,
+        schema: {
+          name: 'person_extractor',
+          schema: {
+            properties: { age: { type: 'number' }, name: { type: 'string' } },
+            type: 'object' as const,
+          },
+        },
+      };
+
+      await instance.generateObject(payload);
+
+      expect(instance['client'].responses.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: 'gpt-5.4-pro',
+          reasoning: { effort: 'high' },
+        }),
+        expect.anything(),
+      );
+    });
+
     it('should handle options correctly', async () => {
       const mockResponse = {
         output_text: '{"status": "success"}',
@@ -1791,6 +2773,7 @@ describe('LobeOpenAICompatibleFactory', () => {
         {
           input: payload.messages,
           model: payload.model,
+          prompt_cache_key: 'lobe:test-user:gpt-4o',
           // @ts-ignore
           text: { format: { strict: true, type: 'json_schema', ...payload.schema } },
           safety_identifier: options.user,
@@ -1799,6 +2782,39 @@ describe('LobeOpenAICompatibleFactory', () => {
       );
 
       expect(result).toEqual({ status: 'success' });
+    });
+
+    it('should add prompt_cache_key for OpenAI generateObject responses requests with user', async () => {
+      const LobeOpenAIProvider = createOpenAICompatibleRuntime({
+        baseURL: 'https://api.openai.com/v1',
+        provider: ModelProvider.OpenAI,
+      });
+
+      const instance = new LobeOpenAIProvider({ apiKey: 'test' });
+      const mockResponse = {
+        output_text: '{"status": "success"}',
+      };
+
+      vi.spyOn(instance['client'].responses, 'create').mockResolvedValue(mockResponse as any);
+
+      const payload = {
+        messages: [{ content: 'Generate status', role: 'user' as const }],
+        model: 'gpt-4o',
+        responseApi: true,
+        schema: {
+          name: 'status_extractor',
+          schema: { properties: { status: { type: 'string' } }, type: 'object' as const },
+        },
+      };
+
+      await instance.generateObject(payload, { user: 'testUser' });
+
+      expect(instance['client'].responses.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt_cache_key: 'lobe:testUser:gpt-4o',
+        }),
+        expect.anything(),
+      );
     });
 
     it('should return undefined when JSON parsing fails', async () => {
@@ -1936,7 +2952,7 @@ describe('LobeOpenAICompatibleFactory', () => {
           status: 400,
         },
         'Error message',
-        {},
+        new Headers(),
       );
 
       vi.spyOn(instance['client'].responses, 'create').mockRejectedValue(apiError);
@@ -2047,6 +3063,7 @@ describe('LobeOpenAICompatibleFactory', () => {
           {
             messages: payload.messages,
             model: payload.model,
+            prompt_cache_key: 'lobe:test-user-123:gpt-4o',
             response_format: { json_schema: payload.schema, type: 'json_schema' },
             user: options.user,
           },
@@ -2054,6 +3071,47 @@ describe('LobeOpenAICompatibleFactory', () => {
         );
 
         expect(result).toEqual({ status: 'completed' });
+      });
+
+      it('should add prompt_cache_key for OpenAI generateObject chat completion requests with user', async () => {
+        const LobeOpenAIProvider = createOpenAICompatibleRuntime({
+          baseURL: 'https://api.openai.com/v1',
+          provider: ModelProvider.OpenAI,
+        });
+
+        const instance = new LobeOpenAIProvider({ apiKey: 'test' });
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                content: '{"status": "completed"}',
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instance['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const payload = {
+          messages: [{ content: 'Generate status', role: 'user' as const }],
+          model: 'gpt-4o',
+          responseApi: false,
+          schema: {
+            name: 'status_extractor',
+            schema: { properties: { status: { type: 'string' } }, type: 'object' as const },
+          },
+        };
+
+        await instance.generateObject(payload, { user: 'testUser' });
+
+        expect(instance['client'].chat.completions.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            prompt_cache_key: 'lobe:testUser:gpt-4o',
+          }),
+          expect.anything(),
+        );
       });
 
       it('should return undefined when JSON parsing fails with chat completions API', async () => {
@@ -2763,9 +3821,59 @@ describe('LobeOpenAICompatibleFactory', () => {
           { headers: undefined, signal: undefined },
         );
 
-        expect(result).toEqual([
-          { arguments: { age: 28, name: 'Alice' }, name: 'person_extractor' },
-        ]);
+        // The fallback returns the parsed schema object, same shape as the
+        // json_schema path
+        expect(result).toEqual({ age: 28, name: 'Alice' });
+      });
+
+      it('should not forward internal thinking to generic OpenAI-compatible generateObject requests', async () => {
+        const mockResponse = {
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    function: {
+                      arguments: '{"name":"Alice","age":28}',
+                      name: 'person_extractor',
+                    },
+                    type: 'function' as const,
+                  },
+                ],
+              },
+            },
+          ],
+        };
+
+        vi.spyOn(instanceWithToolCalling['client'].chat.completions, 'create').mockResolvedValue(
+          mockResponse as any,
+        );
+
+        const payload = {
+          messages: [{ content: 'Extract person info', role: 'user' as const }],
+          model: 'deepseek-v4-pro',
+          reasoning_effort: 'high' as const,
+          schema: {
+            name: 'person_extractor',
+            schema: {
+              properties: { age: { type: 'number' }, name: { type: 'string' } },
+              type: 'object' as const,
+            },
+          },
+          thinking: { budget_tokens: 0, type: 'disabled' as const },
+        };
+
+        await instanceWithToolCalling.generateObject(payload);
+
+        const requestPayload =
+          instanceWithToolCalling['client'].chat.completions.create.mock.calls[0]![0];
+        expect(requestPayload).toEqual(
+          expect.objectContaining({
+            model: 'deepseek-v4-pro',
+          }),
+        );
+        expect(requestPayload).not.toHaveProperty('thinking');
+        expect(requestPayload).not.toHaveProperty('reasoning_effort');
       });
 
       it('should return undefined when no tool call found', async () => {
@@ -2795,7 +3903,10 @@ describe('LobeOpenAICompatibleFactory', () => {
 
         const result = await instanceWithToolCalling.generateObject(payload);
 
-        expect(consoleSpy).toHaveBeenCalledWith('parse tool call arguments error:', undefined);
+        expect(consoleSpy).toHaveBeenCalledWith(
+          'no tool call found in structured output response:',
+          mockResponse.choices[0].message,
+        );
         expect(result).toBeUndefined();
 
         consoleSpy.mockRestore();
@@ -2838,7 +3949,7 @@ describe('LobeOpenAICompatibleFactory', () => {
 
         expect(consoleSpy).toHaveBeenCalledWith(
           'parse tool call arguments error:',
-          mockResponse.choices[0].message.tool_calls,
+          mockResponse.choices[0].message.tool_calls[0],
         );
         expect(result).toBeUndefined();
 
@@ -2890,7 +4001,7 @@ describe('LobeOpenAICompatibleFactory', () => {
           { headers: options.headers, signal: options.signal },
         );
 
-        expect(result).toEqual([{ arguments: { data: 'test' }, name: 'data_extractor' }]);
+        expect(result).toEqual({ data: 'test' });
       });
     });
   });
@@ -2922,7 +4033,10 @@ describe('LobeOpenAICompatibleFactory', () => {
             'ChatGPT-4o is a dynamic model that updates in real time to stay current. It combines strong language understanding and generation, suitable for large-scale applications such as customer support, education, and technical support.',
           displayName: 'GPT-4o',
           enabled: true,
+          family: 'gpt',
+          generation: 'gpt-4o',
           id: 'gpt-4o',
+          knowledgeCutoff: '2023-10',
           maxOutput: 4096,
           pricing: {
             units: [
@@ -2963,7 +4077,10 @@ describe('LobeOpenAICompatibleFactory', () => {
             "Claude 3.7 Sonnet is Anthropic's fastest next-gen model. Compared to Claude 3 Haiku, it improves across skills and surpasses the previous flagship Claude 3 Opus on many intelligence benchmarks.",
           displayName: 'Claude 3.7 Sonnet',
           enabled: false,
+          family: 'claude-sonnet',
+          generation: 'claude-3.7',
           id: 'us.anthropic.claude-3-7-sonnet-20250219-v1:0',
+          knowledgeCutoff: '2024-10',
           maxOutput: 64_000,
           pricing: {
             units: [
@@ -3002,7 +4119,10 @@ describe('LobeOpenAICompatibleFactory', () => {
             'GPT-4o Mini is a small, efficient model with performance similar to GPT-4o.',
           displayName: 'GPT 4o Mini',
           enabled: false,
+          family: 'gpt',
+          generation: 'gpt-4o',
           id: 'gpt-4o-mini',
+          knowledgeCutoff: '2023-10',
           maxOutput: 4096,
           pricing: {
             units: [
@@ -3037,6 +4157,78 @@ describe('LobeOpenAICompatibleFactory', () => {
           type: 'chat',
         },
       ]);
+    });
+  });
+
+  describe('transcribe', () => {
+    it('should transcribe audio and return the text', async () => {
+      const transcribeMock = vi
+        .spyOn(instance['client'].audio.transcriptions, 'create')
+        .mockResolvedValue({ text: 'hello world' } as any);
+
+      const file = new File([new Uint8Array([1, 2, 3])], 'speech.mp3', { type: 'audio/mpeg' });
+
+      const result = await instance.transcribe!({ file, model: 'whisper-1' });
+
+      expect(result).toEqual({ text: 'hello world' });
+      expect(transcribeMock).toHaveBeenCalledWith(
+        expect.objectContaining({ file, model: 'whisper-1' }),
+        expect.anything(),
+      );
+    });
+
+    it('should forward language, prompt and responseFormat to the provider', async () => {
+      const transcribeMock = vi
+        .spyOn(instance['client'].audio.transcriptions, 'create')
+        .mockResolvedValue({ text: '你好' } as any);
+
+      const file = new File([new Uint8Array([1, 2, 3])], 'speech.m4a', { type: 'audio/mp4' });
+
+      await instance.transcribe!(
+        {
+          file,
+          language: 'zh',
+          model: 'whisper-1',
+          prompt: 'hint',
+          responseFormat: 'verbose_json',
+        },
+        { signal: new AbortController().signal },
+      );
+
+      expect(transcribeMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          file,
+          language: 'zh',
+          model: 'whisper-1',
+          prompt: 'hint',
+          response_format: 'verbose_json',
+        }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+
+    it('should wrap a bare Blob into a File using fileName', async () => {
+      const transcribeMock = vi
+        .spyOn(instance['client'].audio.transcriptions, 'create')
+        .mockResolvedValue({ text: 'ok' } as any);
+
+      const blob = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/wav' });
+
+      await instance.transcribe!({ file: blob, fileName: 'remote.wav', model: 'whisper-1' });
+
+      const passedFile = (transcribeMock.mock.calls[0][0] as any).file as File;
+      expect(passedFile).toBeInstanceOf(File);
+      expect(passedFile.name).toBe('remote.wav');
+    });
+
+    it('should throw an error when transcription fails', async () => {
+      vi.spyOn(instance['client'].audio.transcriptions, 'create').mockRejectedValue(
+        new Error('boom'),
+      );
+
+      const file = new File([new Uint8Array([1, 2, 3])], 'speech.mp3', { type: 'audio/mpeg' });
+
+      await expect(instance.transcribe!({ file, model: 'whisper-1' })).rejects.toBeDefined();
     });
   });
 });

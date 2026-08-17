@@ -2,7 +2,7 @@
 
 import { Flexbox } from '@lobehub/ui';
 import { memo } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams } from 'react-router';
 
 import { useDiscoverStore } from '@/store/discover';
 
@@ -36,8 +36,8 @@ const ProviderDetailPage = memo<ProviderDetailPageProps>(({ mobile }) => {
   );
 });
 
-export const MobileProviderPage = memo<{ mobile?: boolean }>(() => {
+export const MobileProviderPage = (_props: { mobile?: boolean }) => {
   return <ProviderDetailPage mobile={true} />;
-});
+};
 
 export default ProviderDetailPage;

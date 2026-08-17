@@ -3,7 +3,7 @@ import { Accordion, AccordionItem, ActionIcon, Block, Flexbox, Icon, Text } from
 import { cssVar } from 'antd-style';
 import { AlertTriangle, Check, HandIcon, Maximize2, Minimize2, X } from 'lucide-react';
 import { AnimatePresence, m as motion } from 'motion/react';
-import { type Key, memo, useEffect, useMemo, useRef, useState } from 'react';
+import { type Key, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import NeuralNetworkLoading from '@/components/NeuralNetworkLoading';
@@ -45,8 +45,7 @@ export type WorkflowExpandLevel = 'collapsed' | 'semi' | 'full';
  *  should differ — e.g. heterogeneous agents want full while streaming but
  *  still collapse once a turn finishes. A plain string applies to both. */
 export type WorkflowExpandLevelDefault =
-  | WorkflowExpandLevel
-  | { completion?: WorkflowExpandLevel; streaming?: WorkflowExpandLevel };
+  WorkflowExpandLevel | { completion?: WorkflowExpandLevel; streaming?: WorkflowExpandLevel };
 
 interface WorkflowCollapseProps {
   /** Assistant group message id (for generation state) */
@@ -61,6 +60,14 @@ interface WorkflowCollapseProps {
    */
   defaultWorkflowExpandLevel?: WorkflowExpandLevelDefault;
   disableEditing?: boolean;
+  /**
+   * Skip the completion auto-collapse (semi → collapsed, an animated Accordion
+   * height transition) because the parent is about to fold the whole workflow
+   * into `ProcessFold` in a single commit. Collapsing twice — once as a
+   * multi-frame animation, once as the fold swap — is what makes the
+   * conversation visibly jitter when a turn with tool calls finishes.
+   */
+  suppressAutoCollapse?: boolean;
   workflowChromeComplete?: boolean;
 }
 
@@ -140,6 +147,7 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
     blocks,
     defaultWorkflowExpandLevel,
     disableEditing,
+    suppressAutoCollapse = false,
     workflowChromeComplete = false,
   }) => {
     const { t } = useTranslation('chat');
@@ -174,16 +182,25 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
     );
     const streamingInitialLevel: WorkflowExpandLevel = streamingDefault ?? 'semi';
     const completionInitialLevel: WorkflowExpandLevel = completionDefault ?? 'collapsed';
+    /** When a consumer opts any phase into `full`, treat the workflow as a
+     *  "fully expanded" experience — manual expands from collapsed go to
+     *  `full` instead of the legacy `semi` cap. Heterogeneous agents rely on
+     *  this so all 40+ tool calls stay visible after the user re-expands. */
+    const manualExpandLevel: WorkflowExpandLevel =
+      streamingDefault === 'full' || completionDefault === 'full' ? 'full' : 'semi';
 
     const [expandLevel, setExpandLevel] = useState<WorkflowExpandLevel>(() =>
       allComplete ? completionInitialLevel : streamingInitialLevel,
     );
     const userOpenedRef = useRef(false);
     const prevCompleteRef = useRef(allComplete);
+    const prevSuppressRef = useRef(suppressAutoCollapse);
 
     useEffect(() => {
       const wasComplete = prevCompleteRef.current;
       prevCompleteRef.current = allComplete;
+      const wasSuppressed = prevSuppressRef.current;
+      prevSuppressRef.current = suppressAutoCollapse;
 
       if (!allComplete && wasComplete) {
         userOpenedRef.current = false;
@@ -191,10 +208,28 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
         return;
       }
 
-      if (allComplete && !wasComplete && !userOpenedRef.current && allTools.length > 0) {
+      const autoCollapsable = !userOpenedRef.current && allTools.length > 0;
+
+      if (allComplete && !wasComplete) {
+        if (!suppressAutoCollapse && autoCollapsable) setExpandLevel(completionInitialLevel);
+        return;
+      }
+
+      // Late release: suppression is held while the turn's operation is still
+      // active, so it can lift *after* completion already happened. That is the
+      // path where the parent ends up NOT folding into ProcessFold (e.g. a
+      // tool-only turn with no final answer), so nothing else will collapse this
+      // workflow — apply the completion level now instead.
+      if (allComplete && wasSuppressed && !suppressAutoCollapse && autoCollapsable) {
         setExpandLevel(completionInitialLevel);
       }
-    }, [allComplete, allTools.length, streamingInitialLevel, completionInitialLevel]);
+    }, [
+      allComplete,
+      allTools.length,
+      streamingInitialLevel,
+      completionInitialLevel,
+      suppressAutoCollapse,
+    ]);
 
     const streaming = !allComplete;
     const forceExpanded = streaming && pendingInterventionPresent;
@@ -298,17 +333,25 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
       !pendingInterventionPresent &&
       workingElapsedSeconds >= WORKFLOW_WORKING_ELAPSED_SHOW_AFTER_MS / TIME_MS_PER_SECOND;
 
-    const handleExpandedChange = (keys: Key[]) => {
-      const nowExpanded = keys.includes('workflow');
-      if (forceExpanded && !nowExpanded) return;
+    // Stable refs so the underlying Accordion's memoized contextValue can
+    // remain reference-stable across WorkflowCollapse re-renders — otherwise
+    // every nested AccordionItem (each GroupTool) re-renders due to "context
+    // changed" on every streaming chunk.
+    const handleExpandedChange = useCallback(
+      (keys: Key[]) => {
+        const nowExpanded = keys.includes('workflow');
+        if (forceExpanded && !nowExpanded) return;
 
-      if (nowExpanded) {
-        setExpandLevel('semi');
-        userOpenedRef.current = true;
-      } else {
-        setExpandLevel('collapsed');
-      }
-    };
+        if (nowExpanded) {
+          setExpandLevel(manualExpandLevel);
+          userOpenedRef.current = true;
+        } else {
+          setExpandLevel('collapsed');
+        }
+      },
+      [forceExpanded, manualExpandLevel],
+    );
+    const expandedKeys = useMemo(() => (isExpanded ? ['workflow'] : []), [isExpanded]);
     const constrained = expandLevel === 'semi';
 
     const { ref: scrollRef, handleScroll: handleAutoScroll } = useAutoScroll<HTMLDivElement>({
@@ -317,24 +360,64 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
       threshold: WORKFLOW_EXPANDED_SCROLL_THRESHOLD_PX,
     });
 
-    const getStatusIcon = (): React.ReactNode => {
+    const renderStatusBlock = (): React.ReactNode => {
+      const wrapInBlock = (inner: React.ReactNode) => (
+        <Block
+          horizontal
+          align="center"
+          flex="none"
+          height={24}
+          justify="center"
+          style={{ fontSize: 12 }}
+          variant="outlined"
+          width={24}
+        >
+          {inner}
+        </Block>
+      );
+
       if (streaming) {
-        return pendingInterventionPresent ? (
-          <Icon color={cssVar.colorInfo} icon={HandIcon} />
-        ) : (
-          <NeuralNetworkLoading size={16} />
+        return wrapInBlock(
+          pendingInterventionPresent ? (
+            <Icon color={cssVar.colorInfo} icon={HandIcon} />
+          ) : (
+            <NeuralNetworkLoading size={16} />
+          ),
         );
       }
 
       switch (completionStatus) {
         case 'error': {
-          return <Icon color={cssVar.colorError} icon={X} />;
+          return wrapInBlock(<Icon color={cssVar.colorError} icon={X} />);
         }
         case 'partial': {
-          return <Icon color={cssVar.colorWarning} icon={AlertTriangle} />;
+          // Mix of success + failure: show success as the primary state and
+          // surface a small warning badge slightly inset from the bottom-right
+          // so the overall turn still reads as "done" rather than "broken".
+          return (
+            <div style={{ flex: 'none', position: 'relative' }}>
+              {wrapInBlock(<Icon color={cssVar.colorSuccess} icon={Check} />)}
+              <div
+                style={{
+                  alignItems: 'center',
+                  background: cssVar.colorBgContainer,
+                  borderRadius: '50%',
+                  bottom: 2,
+                  display: 'flex',
+                  height: 10,
+                  justifyContent: 'center',
+                  position: 'absolute',
+                  right: 2,
+                  width: 10,
+                }}
+              >
+                <Icon color={cssVar.colorWarning} icon={AlertTriangle} size={8} />
+              </div>
+            </div>
+          );
         }
         default: {
-          return <Icon color={cssVar.colorSuccess} icon={Check} />;
+          return wrapInBlock(<Icon color={cssVar.colorSuccess} icon={Check} />);
         }
       }
     };
@@ -377,18 +460,7 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
 
     const title = (
       <Flexbox horizontal align="center" gap={6} style={{ minWidth: 0 }}>
-        <Block
-          horizontal
-          align="center"
-          flex="none"
-          height={24}
-          justify="center"
-          style={{ fontSize: 12 }}
-          variant="outlined"
-          width={24}
-        >
-          {getStatusIcon()}
-        </Block>
+        {renderStatusBlock()}
         {streaming ? (
           <Flexbox
             horizontal
@@ -397,11 +469,10 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
             style={{
               minHeight: WORKFLOW_STREAMING_TITLE_MIN_HEIGHT_PX,
               minWidth: 0,
-              overflow: 'hidden',
             }}
           >
             <div style={{ minWidth: 0, overflow: 'hidden' }}>
-              <AnimatePresence initial={false} mode="wait">
+              <AnimatePresence initial={false} mode="popLayout">
                 <motion.div
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -8 }}
@@ -419,6 +490,7 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
                     style={{
                       color: pendingInterventionPresent ? cssVar.colorInfo : undefined,
                       overflow: 'hidden',
+                      paddingBlock: 1,
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
                     }}
@@ -436,12 +508,13 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
             )}
           </Flexbox>
         ) : (
-          <Flexbox horizontal align="center" gap={6} style={{ minWidth: 0, overflow: 'hidden' }}>
+          <Flexbox horizontal align="center" gap={6} style={{ minWidth: 0 }}>
             <Text
               type="secondary"
               style={{
                 minWidth: 0,
                 overflow: 'hidden',
+                paddingBlock: 1,
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
               }}
@@ -460,7 +533,7 @@ const WorkflowCollapse = memo<WorkflowCollapseProps>(
 
     return (
       <Accordion
-        expandedKeys={isExpanded ? ['workflow'] : []}
+        expandedKeys={expandedKeys}
         variant="borderless"
         onExpandedChange={handleExpandedChange}
       >

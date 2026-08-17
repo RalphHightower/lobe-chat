@@ -43,10 +43,26 @@ export interface EditorCanvasProps {
   autoSave?: boolean;
 
   /**
+   * Reload an already-mounted editor when an authoritative external content
+   * revision changes. Keep this stable for local autosave echoes and unchanged
+   * refetches so unsaved input is never replaced by prop identity churn.
+   */
+  contentRevision?: number;
+
+  disabled?: boolean;
+
+  /**
    * Document ID to load from server.
    * When provided, component will use useSWR to fetch document data.
    */
   documentId?: string;
+
+  /**
+   * Whether the editor accepts input. Defaults to true. Set false to render
+   * the content read-only (still preserves Lexical-node attributes like image
+   * width/height, which a plain markdown renderer would drop).
+   */
+  editable?: boolean;
 
   /**
    * Editor data to render directly (skip fetch).
@@ -84,6 +100,12 @@ export interface EditorCanvasProps {
    * Editor initialization handler
    */
   onInit?: (editor: IEditor) => void;
+
+  /**
+   * Press-enter handler. Return true to claim the event (suppresses newline).
+   * Forwarded to the underlying Editor.
+   */
+  onPressEnter?: (props: { editor: IEditor; event: KeyboardEvent }) => boolean | void;
 
   /**
    * Placeholder text for empty editor

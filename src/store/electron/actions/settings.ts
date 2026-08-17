@@ -7,6 +7,7 @@ import { type SWRResponse } from 'swr';
 import useSWR from 'swr';
 
 import { mutate } from '@/libs/swr';
+import { electronKeys } from '@/libs/swr/keys';
 import { desktopSettingsService } from '@/services/electron/settings';
 import { type StoreSetter } from '@/store/types';
 
@@ -15,9 +16,6 @@ import { type ElectronStore } from '../store';
 /**
  * Settings actions
  */
-
-const ELECTRON_PROXY_SETTINGS_KEY = 'electron:getProxySettings';
-const ELECTRON_DESKTOP_HOTKEYS_KEY = 'electron:getDesktopHotkeys';
 
 type Setter = StoreSetter<ElectronStore>;
 export const settingsSlice = (set: Setter, get: () => ElectronStore, _api?: unknown) =>
@@ -34,11 +32,21 @@ export class ElectronSettingsActionImpl {
   }
 
   refreshDesktopHotkeys = async (): Promise<void> => {
-    await mutate(ELECTRON_DESKTOP_HOTKEYS_KEY);
+    await mutate(electronKeys.desktopHotkeys());
+  };
+
+  refreshAppTrayVisible = async (): Promise<void> => {
+    await mutate(electronKeys.appTrayVisible());
   };
 
   refreshProxySettings = async (): Promise<void> => {
-    await mutate(ELECTRON_PROXY_SETTINGS_KEY);
+    await mutate(electronKeys.proxySettings());
+  };
+
+  setAppTrayVisible = async (visible: boolean): Promise<void> => {
+    await desktopSettingsService.setAppTrayVisible(visible);
+    this.#set({ appTrayVisible: visible });
+    await this.#get().refreshAppTrayVisible();
   };
 
   setProxySettings = async (values: Partial<NetworkProxySettings>): Promise<void> => {
@@ -68,7 +76,7 @@ export class ElectronSettingsActionImpl {
 
   useFetchDesktopHotkeys = (): SWRResponse => {
     return useSWR<Record<string, string>>(
-      ELECTRON_DESKTOP_HOTKEYS_KEY,
+      electronKeys.desktopHotkeys(),
       async () => desktopSettingsService.getDesktopHotkeys(),
       {
         onSuccess: (data) => {
@@ -80,9 +88,23 @@ export class ElectronSettingsActionImpl {
     );
   };
 
+  useGetAppTrayVisible = (enabled = true): SWRResponse => {
+    return useSWR<boolean>(
+      enabled ? electronKeys.appTrayVisible() : null,
+      async () => desktopSettingsService.getAppTrayVisible(),
+      {
+        onSuccess: (data) => {
+          if (data !== this.#get().appTrayVisible) {
+            this.#set({ appTrayVisible: data });
+          }
+        },
+      },
+    );
+  };
+
   useGetProxySettings = (): SWRResponse => {
     return useSWR<NetworkProxySettings>(
-      ELECTRON_PROXY_SETTINGS_KEY,
+      electronKeys.proxySettings(),
       async () => desktopSettingsService.getProxySettings(),
       {
         onSuccess: (data) => {

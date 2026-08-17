@@ -1,13 +1,17 @@
+import { existsSync } from 'node:fs';
 import path from 'node:path';
-
-import { pathExistsSync } from 'fs-extra';
 
 import { rendererDir } from '@/const/dir';
 import { isDev } from '@/const/env';
 import { getDesktopEnv } from '@/env';
 import { createLogger } from '@/utils/logger';
 
-import { RendererProtocolManager } from './RendererProtocolManager';
+import {
+  RendererProtocolManager,
+  type RendererRequestInterceptor,
+  StaticRendererFallback,
+  ViteRendererFallback,
+} from './RendererProtocolManager';
 
 const logger = createLogger('core:RendererUrlManager');
 
@@ -20,12 +24,11 @@ const POPUP_ENTRY_HTML = path.join(rendererDir, 'apps', 'desktop', 'popup.html')
 export class RendererUrlManager {
   private readonly rendererProtocolManager: RendererProtocolManager;
   private readonly rendererStaticOverride = getDesktopEnv().DESKTOP_RENDERER_STATIC;
-  private rendererLoadedUrl: string;
+  private readonly rendererLoadedUrl: string;
 
   constructor() {
     this.rendererProtocolManager = new RendererProtocolManager({
-      rendererDir,
-      resolveRendererFilePath: this.resolveRendererFilePath,
+      fallback: this.pickFallback(),
     });
 
     this.rendererLoadedUrl = this.rendererProtocolManager.getRendererUrl();
@@ -35,31 +38,22 @@ export class RendererUrlManager {
     return this.rendererProtocolManager.protocolScheme;
   }
 
-  /**
-   * Configure renderer loading strategy for dev/prod
-   */
-  configureRendererLoader() {
-    const electronRendererUrl = process.env['ELECTRON_RENDERER_URL'];
-
-    if (isDev && !this.rendererStaticOverride && electronRendererUrl) {
-      this.rendererLoadedUrl = electronRendererUrl;
-      this.setupDevRenderer();
-      return;
-    }
-
-    if (isDev && !this.rendererStaticOverride && !electronRendererUrl) {
-      logger.warn('Dev mode: ELECTRON_RENDERER_URL not set, falling back to protocol handler');
-    }
-
-    if (isDev && this.rendererStaticOverride) {
-      logger.warn('Dev mode: DESKTOP_RENDERER_STATIC enabled, using static renderer handler');
-    }
-
-    this.setupProdRenderer();
+  addRequestInterceptor(interceptor: RendererRequestInterceptor) {
+    this.rendererProtocolManager.addRequestInterceptor(interceptor);
   }
 
   /**
-   * Build renderer URL for dev/prod.
+   * Register the `app://` protocol handler. Idempotent — safe to call after
+   * interceptors are wired.
+   */
+  configureRendererLoader() {
+    this.rendererProtocolManager.registerHandler();
+  }
+
+  /**
+   * Build a renderer URL. Always uses `app://renderer` so dev and prod share
+   * the same origin (cookies, storage, service-workers). Dev requests are
+   * proxied to the Vite dev server inside the `app://` handler.
    */
   buildRendererUrl(path: string): string {
     const cleanPath = path.startsWith('/') ? path : `/${path}`;
@@ -69,7 +63,10 @@ export class RendererUrlManager {
   }
 
   /**
-   * Resolve renderer file path in production.
+   * Resolve a renderer file path against the static export. Used by the
+   * production fallback; left on the manager so the desktop-specific entry
+   * HTML mappings stay in one place.
+   *
    * Static assets map directly; /overlay routes fall back to overlay.html;
    * popup routes go to popup.html; all other routes fall back to index.html (SPA).
    */
@@ -79,7 +76,7 @@ export class RendererUrlManager {
     // Static assets: direct file mapping
     if (pathname.startsWith('/assets/') || path.extname(pathname)) {
       const filePath = path.join(rendererDir, pathname);
-      return pathExistsSync(filePath) ? filePath : null;
+      return existsSync(filePath) ? filePath : null;
     }
 
     // Overlay entry (separate MPA page)
@@ -96,20 +93,26 @@ export class RendererUrlManager {
     return SPA_ENTRY_HTML;
   };
 
-  /**
-   * Development: use electron-vite renderer dev server
-   */
-  private setupDevRenderer() {
-    logger.info(
-      `Development mode: renderer served from electron-vite dev server at ${this.rendererLoadedUrl}`,
-    );
-  }
+  private pickFallback() {
+    const electronRendererUrl = process.env['ELECTRON_RENDERER_URL'];
 
-  /**
-   * Production: serve static renderer assets via protocol handler
-   */
-  private setupProdRenderer() {
-    this.rendererLoadedUrl = this.rendererProtocolManager.getRendererUrl();
-    this.rendererProtocolManager.registerHandler();
+    if (isDev && !this.rendererStaticOverride && electronRendererUrl) {
+      logger.info(
+        `Development mode: app:// requests proxied to Vite dev server at ${electronRendererUrl}`,
+      );
+      return new ViteRendererFallback(electronRendererUrl);
+    }
+
+    if (isDev && !this.rendererStaticOverride && !electronRendererUrl) {
+      logger.warn(
+        'Dev mode: ELECTRON_RENDERER_URL not set, falling back to static renderer handler',
+      );
+    }
+
+    if (isDev && this.rendererStaticOverride) {
+      logger.warn('Dev mode: DESKTOP_RENDERER_STATIC enabled, using static renderer handler');
+    }
+
+    return new StaticRendererFallback(rendererDir, this.resolveRendererFilePath);
   }
 }

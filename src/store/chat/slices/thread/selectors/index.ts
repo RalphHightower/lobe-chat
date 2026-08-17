@@ -1,4 +1,4 @@
-import { type ThreadItem, type UIChatMessage } from '@lobechat/types';
+import { type ThreadItem, ThreadType, type UIChatMessage } from '@lobechat/types';
 
 import { useAgentStore } from '@/store/agent';
 import { agentChatConfigSelectors } from '@/store/agent/selectors';
@@ -24,6 +24,22 @@ const currentPortalThread = (s: ChatStoreState): ThreadItem | undefined => {
   return threads.find((t) => t.id === s.portalThreadId);
 };
 
+const currentActiveThread = (s: ChatStoreState): ThreadItem | undefined => {
+  if (!s.activeThreadId) return undefined;
+
+  const threads = currentTopicThreads(s);
+
+  return threads.find((t) => t.id === s.activeThreadId);
+};
+
+const isActiveThreadSubagent = (s: ChatStoreState): boolean => {
+  const thread = currentActiveThread(s);
+  // Only tool-spawned subagent threads are externally owned and read-only.
+  // Direct @Agent isolation threads are ordinary target-Agent conversations
+  // after the delegated run completes, so users can continue chatting there.
+  return !!thread?.metadata?.sourceToolCallId;
+};
+
 const getThreadsByTopic = (topicId?: string) => (s: ChatStoreState) => {
   if (!topicId) return;
 
@@ -34,6 +50,14 @@ const getThreadsBySourceMsgId = (id: string) => (s: ChatStoreState) => {
   const threads = currentTopicThreads(s);
 
   return threads.filter((t) => t.sourceMessageId === id);
+};
+
+const getIsolationThreadBySourceMsgId = (id: string) => (s: ChatStoreState) => {
+  const threads = currentTopicThreads(s);
+
+  return threads.find(
+    (thread) => thread.sourceMessageId === id && thread.type === ThreadType.Isolation,
+  );
 };
 
 const hasThreadBySourceMsgId = (id: string) => (s: ChatStoreState) => {
@@ -88,6 +112,31 @@ const getThreadChildMessages =
   };
 
 /**
+ * Raw DB-level child messages for a thread, keyed by `messageMapKey` thread scope.
+ *
+ * Use this for *counting* / *aggregating* over individual messages (e.g. the
+ * subagent inspector chip's tool count + token total). Do NOT use it for
+ * rendering — the display layer reads from `messagesMap` (which groups tools
+ * into a virtual `assistantGroup`), so the shapes intentionally differ.
+ *
+ * Why `dbMessagesMap` not `messagesMap`: `messagesMap[thread_*]` only holds
+ * the rendered shape ([user, assistantGroup]); individual `role==='tool'` /
+ * `role==='assistant'` rows live in `dbMessagesMap[thread_*]`.
+ */
+const getThreadDbMessages =
+  (id?: string) =>
+  (s: ChatStoreState): UIChatMessage[] => {
+    if (!id || !s.activeAgentId) return [];
+    const key = messageMapKey({
+      agentId: s.activeAgentId,
+      groupId: s.activeGroupId,
+      threadId: id,
+      topicId: s.activeTopicId,
+    });
+    return (s.dbMessagesMap?.[key] || []) as UIChatMessage[];
+  };
+
+/**
  * Portal AI chats - used for AI title summarization
  */
 const portalAIChats = (s: ChatStoreState) => {
@@ -122,11 +171,16 @@ const portalDisplayChatsString = (s: ChatStoreState) => {
 };
 
 export const threadSelectors = {
+  currentActiveThread,
   currentPortalThread,
   currentTopicThreads,
+  getThreadChildMessages,
+  getThreadDbMessages,
+  getIsolationThreadBySourceMsgId,
   getThreadsBySourceMsgId,
   getThreadsByTopic,
   hasThreadBySourceMsgId,
+  isActiveThreadSubagent,
   portalAIChats,
   portalAIChatsWithHistoryConfig,
   portalDisplayChatsString,

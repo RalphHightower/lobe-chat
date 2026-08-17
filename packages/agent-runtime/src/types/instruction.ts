@@ -1,6 +1,7 @@
 import type {
   ChatToolPayload,
   ModelUsage,
+  RuntimeAdditionalContextFragment,
   RuntimeInitialContext,
   RuntimeStepContext,
 } from '@lobechat/types';
@@ -20,6 +21,9 @@ export interface AgentRuntimeContext {
    */
   initialContext?: RuntimeInitialContext;
 
+  /** Zero-based instruction position within the current runtime step */
+  instructionIndex?: number;
+
   metadata?: Record<string, unknown>;
 
   /** Operation ID (links to Operation for business context) */
@@ -35,8 +39,8 @@ export interface AgentRuntimeContext {
     | 'llm_result'
     | 'tool_result'
     | 'tools_batch_result'
-    | 'task_result'
-    | 'tasks_batch_result'
+    | 'sub_agent_result'
+    | 'sub_agents_batch_result'
     | 'human_response'
     | 'human_approved_tool'
     | 'human_abort'
@@ -45,6 +49,7 @@ export interface AgentRuntimeContext {
 
   /** Session info (kept for backward compatibility, will be optional in the future) */
   session?: {
+    eventCount?: number;
     messageCount: number;
     sessionId: string;
     status: AgentState['status'];
@@ -53,7 +58,7 @@ export interface AgentRuntimeContext {
 
   /**
    * Step context computed at the beginning of each step
-   * Contains dynamic state like GTD todos that changes between steps
+   * Contains dynamic state like lobe-agent todos that changes between steps
    * Computed by AgentRuntime and passed to Context Engine and Tool Executors
    */
   stepContext?: RuntimeStepContext;
@@ -115,6 +120,8 @@ export interface Agent {
 // ── Payloads ──────────────────────────────────────────────
 
 export interface CallLLMPayload {
+  additionalContexts?: readonly RuntimeAdditionalContextFragment[];
+  allowedToolNames?: string[];
   isFirstMessage?: boolean;
   messages: any[];
   model: string;
@@ -148,71 +155,70 @@ export interface HumanAbortPayload {
 }
 
 /**
- * Task definition for exec_tasks instruction
+ * Sub-agent definition for exec_sub_agents instruction
  */
-export interface ExecTaskItem {
-  /** Brief description of what this task does (shown in UI) */
+export interface SubAgentTask {
+  /** Brief description of what this sub-agent does (shown in UI) */
   description: string;
   /** Whether to inherit context messages from parent conversation */
   inheritMessages?: boolean;
-  /** Detailed instruction/prompt for the task execution */
+  /** Detailed instruction/prompt for the sub-agent execution */
   instruction: string;
   /**
-   * Whether to execute the task on the client side (desktop only).
-   * When true and running on desktop, the task will be executed locally
-   * with access to local tools (file system, shell commands, etc.).
+   * Whether to execute the sub-agent on the client side (desktop only).
+   * When true and running on desktop, the sub-agent runs locally with
+   * access to local tools (file system, shell commands, etc.).
    *
-   * IMPORTANT: This MUST be set to true when the task requires:
+   * IMPORTANT: This MUST be set to true when the sub-agent requires:
    * - Reading/writing local files via `local-system` tool
    * - Executing shell commands
    * - Any other desktop-only local tool operations
    *
-   * If not specified or false, the task runs on the server (default behavior).
-   * On non-desktop platforms (web), this flag is ignored and tasks always run on server.
+   * If not specified or false, the sub-agent runs on the server (default behavior).
+   * On non-desktop platforms (web), this flag is ignored and sub-agents always
+   * run on the server.
    */
   runInClient?: boolean;
+  /** Agent selected by callAgent; defaults to the current runtime agent when omitted */
+  targetAgentId?: string;
   /** Timeout in milliseconds (optional, default 30 minutes) */
   timeout?: number;
 }
 
 /**
- * Payload for task_result phase (single task)
+ * Payload for sub_agent_result phase (single sub-agent)
  */
-export interface TaskResultPayload {
+export interface SubAgentResultPayload {
   /** Parent message ID */
   parentMessageId: string;
-  /** Result from executed task */
+  /** Result from executed sub-agent */
   result: {
-    /** Error message if task failed */
+    /** Error message if sub-agent failed */
     error?: string;
-    /** Task result content */
+    /** Sub-agent result content */
     result?: string;
-    /** Whether the task completed successfully */
+    /** Whether the sub-agent completed successfully */
     success: boolean;
-    /** Task message ID */
-    taskMessageId: string;
-    /** Thread ID where the task was executed */
+    /** Thread ID where the sub-agent was executed */
     threadId: string;
   };
 }
 
 /**
- * Payload for tasks_batch_result phase (multiple tasks)
+ * Payload for sub_agents_batch_result phase (multiple sub-agents)
  */
-export interface TasksBatchResultPayload {
+export interface SubAgentsBatchResultPayload {
   /** Parent message ID */
   parentMessageId: string;
-  /** Results from executed tasks */
+  /** Results from executed sub-agents */
   results: Array<{
-    /** Error message if task failed */
+    /** Error message if sub-agent failed */
     error?: string;
-    /** Task result content */
+    /** Sub-agent result content */
     result?: string;
-    /** Whether the task completed successfully */
+    /** Whether the sub-agent completed successfully */
     success: boolean;
-    /** Task message ID */
-    taskMessageId: string;
-    /** Thread ID where the task was executed */
+    /** Thread ID where the sub-agent was executed */
     threadId: string;
   }>;
 }
@@ -254,6 +260,14 @@ export interface AgentInstructionCallTool extends AgentInstructionBase {
 
 export interface AgentInstructionCallToolsBatch extends AgentInstructionBase {
   payload: {
+    /**
+     * `tool_call_id → existing tool message id`, for tools whose row already
+     * exists as a pending placeholder (batch human approval: the approval pause
+     * created one row per pending tool). The executor UPDATES those rows instead
+     * of inserting new ones — without this, resuming an approved batch would
+     * duplicate every tool message and orphan the pending originals.
+     */
+    existingToolMessageIds?: Record<string, string>;
     parentMessageId: string;
     toolsCalling: ChatToolPayload[];
   } & any;
@@ -262,6 +276,15 @@ export interface AgentInstructionCallToolsBatch extends AgentInstructionBase {
 
 export interface AgentInstructionResolveAbortedTools extends AgentInstructionBase {
   payload: {
+    /**
+     * `tool_call_id → existing tool message id`, for calls whose row is already
+     * on disk as a pending placeholder (an approval pause creates one row per
+     * pending tool). The executor UPDATES those rows to the aborted state
+     * instead of inserting new ones — without this, aborting a parked approval
+     * duplicates every tool row and leaves the originals `pending`, so the
+     * approval cards stay on screen after Stop.
+     */
+    existingToolMessageIds?: Record<string, string>;
     /** Parent message ID (assistant message) */
     parentMessageId: string;
     /** Reason for the abort */
@@ -272,46 +295,40 @@ export interface AgentInstructionResolveAbortedTools extends AgentInstructionBas
   type: 'resolve_aborted_tools';
 }
 
-// ─ Task ──────────────────────────────────────────────────
-
-export interface AgentInstructionExecTask extends AgentInstructionBase {
+export interface AgentInstructionResolveBlockedTools extends AgentInstructionBase {
   payload: {
-    /** Parent message ID (tool message that triggered the task) */
+    /** Optional message to write into blocked tool result content */
+    blockedContent?: string;
+    /** Optional machine-readable blocked reason */
+    blockedReason?: string;
+    /** Parent message ID (assistant message) */
     parentMessageId: string;
-    /** Task to execute */
-    task: ExecTaskItem;
+    /** Tool calls that were blocked and need tool results */
+    toolsCalling: ChatToolPayload[];
   };
-  type: 'exec_task';
+  type: 'resolve_blocked_tools';
 }
 
-export interface AgentInstructionExecTasks extends AgentInstructionBase {
+// ─ Sub-Agent ─────────────────────────────────────────────
+
+export interface AgentInstructionExecSubAgent extends AgentInstructionBase {
   payload: {
-    /** Parent message ID (tool message that triggered the tasks) */
+    /** Parent message ID (tool message that dispatched the sub-agent) */
     parentMessageId: string;
-    /** Array of tasks to execute */
-    tasks: ExecTaskItem[];
+    /** Sub-agent to execute */
+    task: SubAgentTask;
   };
-  type: 'exec_tasks';
+  type: 'exec_sub_agent';
 }
 
-export interface AgentInstructionExecClientTask extends AgentInstructionBase {
+export interface AgentInstructionExecSubAgents extends AgentInstructionBase {
   payload: {
-    /** Parent message ID (tool message that triggered the task) */
+    /** Parent message ID (tool message that dispatched the sub-agents) */
     parentMessageId: string;
-    /** Task to execute */
-    task: ExecTaskItem;
+    /** Array of sub-agents to execute */
+    tasks: SubAgentTask[];
   };
-  type: 'exec_client_task';
-}
-
-export interface AgentInstructionExecClientTasks extends AgentInstructionBase {
-  payload: {
-    /** Parent message ID (tool message that triggered the tasks) */
-    parentMessageId: string;
-    /** Array of tasks to execute */
-    tasks: ExecTaskItem[];
-  };
-  type: 'exec_client_tasks';
+  type: 'exec_sub_agents';
 }
 
 // ─ Human Interaction ─────────────────────────────────────
@@ -333,6 +350,17 @@ export interface AgentInstructionRequestHumanSelect extends AgentInstructionBase
 }
 
 export interface AgentInstructionRequestHumanApprove extends AgentInstructionBase {
+  /**
+   * The assistant message that emitted `pendingToolsCalling`. Any producer that
+   * creates pending tool rows should set it, so those rows land under their real
+   * owner — see the parent resolution comment in `executors/humanApprove.ts`.
+   *
+   * Optional for the `skipCreateToolMessage` (resume) paths, which create no
+   * rows, and for backwards compatibility with producers that omit it: the
+   * executor still falls back to scanning `state.messages`, which is accurate
+   * only within a single step.
+   */
+  parentMessageId?: string;
   pendingToolsCalling: ChatToolPayload[];
   reason?: string;
   skipCreateToolMessage?: boolean;
@@ -372,11 +400,10 @@ export type AgentInstruction =
   | AgentInstructionCallTool
   | AgentInstructionCallToolsBatch
   | AgentInstructionResolveAbortedTools
-  // Task
-  | AgentInstructionExecTask
-  | AgentInstructionExecTasks
-  | AgentInstructionExecClientTask
-  | AgentInstructionExecClientTasks
+  | AgentInstructionResolveBlockedTools
+  // Sub-Agent
+  | AgentInstructionExecSubAgent
+  | AgentInstructionExecSubAgents
   // Human Interaction
   | AgentInstructionRequestHumanPrompt
   | AgentInstructionRequestHumanSelect

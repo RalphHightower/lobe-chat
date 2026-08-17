@@ -7,6 +7,8 @@ import {
   type RedisKey,
   type RedisMSetArgument,
   type RedisPipeline,
+  type RedisScanArgs,
+  type RedisScanResult,
   type RedisSetResult,
   type RedisValue,
   type SetOptions,
@@ -14,6 +16,9 @@ import {
 import { buildIORedisSetArgs, normalizeMsetValues } from './utils';
 
 const log = debug('lobe:redis');
+
+const REDIS_CONNECT_TIMEOUT_MS = 10_000;
+const REDIS_COMMAND_TIMEOUT_MS = 10_000;
 
 export class IoRedisRedisProvider implements BaseRedisProvider {
   private client: Redis | null = null;
@@ -24,6 +29,8 @@ export class IoRedisRedisProvider implements BaseRedisProvider {
     const IORedis = await import('ioredis');
 
     this.client = new IORedis.default(this.config.url, {
+      commandTimeout: REDIS_COMMAND_TIMEOUT_MS,
+      connectTimeout: REDIS_CONNECT_TIMEOUT_MS,
       db: this.config.database,
       keyPrefix: this.config.prefix ? `${this.config.prefix}:` : undefined,
       lazyConnect: true,
@@ -80,6 +87,19 @@ export class IoRedisRedisProvider implements BaseRedisProvider {
 
   async ttl(key: RedisKey): Promise<number> {
     return this.ensureClient().ttl(key);
+  }
+
+  async scan(cursor: string, ...args: RedisScanArgs): Promise<RedisScanResult> {
+    const client = this.ensureClient();
+
+    if (args.length === 0) return client.scan(cursor);
+    if (args[0] === 'MATCH' && args.length === 2) return client.scan(cursor, 'MATCH', args[1]);
+    if (args[0] === 'COUNT' && args.length === 2) return client.scan(cursor, 'COUNT', args[1]);
+    if (args[0] === 'MATCH') {
+      return client.scan(cursor, 'MATCH', args[1], 'COUNT', args[3]);
+    }
+
+    return client.scan(cursor, 'MATCH', args[3], 'COUNT', args[1]);
   }
 
   async incr(key: RedisKey): Promise<number> {

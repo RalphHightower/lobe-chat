@@ -1,16 +1,39 @@
-import { and, asc, count, desc, eq, isNull, or } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, isNull, or } from 'drizzle-orm';
 
 import { agentEvalDatasets, agentEvalTestCases, type NewAgentEvalDataset } from '../../schemas';
 import { type LobeChatDatabase } from '../../type';
+import { buildWorkspaceWhere } from '../../utils/workspace';
+
+interface QueryDatasetsFilters {
+  benchmarkId?: string;
+  benchmarkIds?: string[];
+  sourceExperimentId?: string;
+}
 
 export class AgentEvalDatasetModel {
   private userId: string;
   private db: LobeChatDatabase;
+  private workspaceId?: string;
 
-  constructor(db: LobeChatDatabase, userId: string) {
+  constructor(db: LobeChatDatabase, userId: string, workspaceId?: string) {
     this.db = db;
     this.userId = userId;
+    this.workspaceId = workspaceId;
   }
+
+  /** Includes system datasets (`userId IS NULL`) on read. */
+  private ownership = () =>
+    or(
+      buildWorkspaceWhere(
+        { userId: this.userId, workspaceId: this.workspaceId },
+        agentEvalDatasets,
+      ),
+      isNull(agentEvalDatasets.userId),
+    );
+
+  /** Mutate-only predicate excluding system rows. */
+  private mutableOwnership = () =>
+    buildWorkspaceWhere({ userId: this.userId, workspaceId: this.workspaceId }, agentEvalDatasets);
 
   /**
    * Create a new dataset
@@ -18,7 +41,7 @@ export class AgentEvalDatasetModel {
   create = async (params: NewAgentEvalDataset) => {
     const [result] = await this.db
       .insert(agentEvalDatasets)
-      .values({ ...params, userId: this.userId })
+      .values({ ...params, userId: this.userId, workspaceId: this.workspaceId ?? null })
       .returning();
     return result;
   };
@@ -29,20 +52,29 @@ export class AgentEvalDatasetModel {
   delete = async (id: string) => {
     return this.db
       .delete(agentEvalDatasets)
-      .where(and(eq(agentEvalDatasets.id, id), eq(agentEvalDatasets.userId, this.userId)));
+      .where(and(eq(agentEvalDatasets.id, id), this.mutableOwnership()));
   };
 
   /**
-   * Query datasets (system + user-owned) with test case counts
-   * @param benchmarkId - Optional benchmark filter
+   * Query datasets (system + user/workspace-owned) with test case counts
+   * @param filters - Optional benchmark / experiment filters
    */
-  query = async (benchmarkId?: string) => {
-    const conditions = [
-      or(eq(agentEvalDatasets.userId, this.userId), isNull(agentEvalDatasets.userId)),
-    ];
+  query = async (filters?: QueryDatasetsFilters) => {
+    const { benchmarkId, benchmarkIds, sourceExperimentId } = filters || {};
+    const conditions = [this.ownership()];
 
     if (benchmarkId) {
       conditions.push(eq(agentEvalDatasets.benchmarkId, benchmarkId));
+    }
+
+    if (benchmarkIds && benchmarkIds.length > 0) {
+      conditions.push(inArray(agentEvalDatasets.benchmarkId, benchmarkIds));
+    }
+
+    if (sourceExperimentId) {
+      conditions.push(eq(agentEvalDatasets.sourceExperimentId, sourceExperimentId));
+      // Scoped subsets are experiment-owned; exclude system rows from this scope.
+      conditions.push(this.mutableOwnership());
     }
 
     return this.db
@@ -56,6 +88,7 @@ export class AgentEvalDatasetModel {
         identifier: agentEvalDatasets.identifier,
         metadata: agentEvalDatasets.metadata,
         name: agentEvalDatasets.name,
+        sourceExperimentId: agentEvalDatasets.sourceExperimentId,
         testCaseCount: count(agentEvalTestCases.id).as('testCaseCount'),
         updatedAt: agentEvalDatasets.updatedAt,
         userId: agentEvalDatasets.userId,
@@ -74,12 +107,7 @@ export class AgentEvalDatasetModel {
     const [dataset] = await this.db
       .select()
       .from(agentEvalDatasets)
-      .where(
-        and(
-          eq(agentEvalDatasets.id, id),
-          or(eq(agentEvalDatasets.userId, this.userId), isNull(agentEvalDatasets.userId)),
-        ),
-      )
+      .where(and(eq(agentEvalDatasets.id, id), this.ownership()))
       .limit(1);
 
     if (!dataset) return undefined;
@@ -100,7 +128,7 @@ export class AgentEvalDatasetModel {
     const [result] = await this.db
       .update(agentEvalDatasets)
       .set({ ...value, updatedAt: new Date() })
-      .where(and(eq(agentEvalDatasets.id, id), eq(agentEvalDatasets.userId, this.userId)))
+      .where(and(eq(agentEvalDatasets.id, id), this.mutableOwnership()))
       .returning();
     return result;
   };

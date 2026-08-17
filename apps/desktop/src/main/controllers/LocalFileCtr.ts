@@ -1,7 +1,8 @@
 import { constants } from 'node:fs';
-import { access, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 
+import type { SkillDirectoryDeps } from '@lobechat/device-control';
 import {
   type AuditSafePathsParams,
   type AuditSafePathsResult,
@@ -12,6 +13,9 @@ import {
   type GrepContentParams,
   type GrepContentResult,
   type ListLocalFileParams,
+  type LocalFilePreviewResult,
+  type LocalFilePreviewUrlParams,
+  type LocalFilePreviewUrlResult,
   type LocalMoveFilesResultItem,
   type LocalReadFileParams,
   type LocalReadFileResult,
@@ -24,6 +28,11 @@ import {
   type PickFileResult,
   type PrepareSkillDirectoryParams,
   type PrepareSkillDirectoryResult,
+  type ProjectFileIndexEntry,
+  type ProjectFileIndexParams,
+  type ProjectFileIndexResult,
+  type ProjectFileSearchParams,
+  type ProjectFileSearchResult,
   type RenameLocalFileResult,
   type ResolveSkillResourcePathParams,
   type ResolveSkillResourcePathResult,
@@ -35,18 +44,21 @@ import {
 } from '@lobechat/electron-client-ipc';
 import {
   editLocalFile,
+  expandTilde,
   listLocalFiles,
   moveLocalFiles,
   readLocalFile,
   renameLocalFile,
+  resolveAgainstCwd,
   writeLocalFile,
-} from '@lobechat/local-file-shell';
+} from '@lobechat/local-file-shell/file';
+import type { FileResult, SearchOptions } from '@lobechat/local-file-shell/types';
+import { resolveMimeType } from '@lobechat/utils/mimeType';
 import { dialog, shell } from 'electron';
-import { unzipSync } from 'fflate';
 
-import { type FileResult, type SearchOptions } from '@/modules/fileSearch';
 import ContentSearchService from '@/services/contentSearchSrv';
 import FileSearchService from '@/services/fileSearchSrv';
+import RemoteFileUploadService from '@/services/remoteFileUploadSrv';
 import { createLogger } from '@/utils/logger';
 import { netFetch } from '@/utils/net-fetch';
 
@@ -56,6 +68,42 @@ import { ControllerModule, IpcMethod } from './index';
 const logger = createLogger('controllers:LocalFileCtr');
 
 const SAFE_PATH_PREFIXES = ['/tmp', '/var/tmp'] as const;
+const PROJECT_FILE_GLOB_LIMIT = 5000;
+
+/**
+ * Image extensions `readFile` uploads to file storage instead of refusing as
+ * binary. The agent then sees the image (vision) via an `image_url` part,
+ * rather than hitting "Unsupported binary file".
+ *
+ * Limited to the formats vision providers accept (Anthropic/OpenAI:
+ * png/jpeg/gif/webp) — anything else would be silently dropped by the
+ * model-runtime builders, which is worse than the binary refusal. SVG is
+ * intentionally absent: it's text, and reading the source is more useful to
+ * the model than a rasterization we can't produce here.
+ */
+const LOCAL_IMAGE_EXT_TO_MIME: Record<string, string> = {
+  gif: 'image/gif',
+  jpeg: 'image/jpeg',
+  jpg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+};
+
+/** Refuse to load image bytes beyond this size — providers reject them anyway. */
+const MAX_IMAGE_READ_BYTES = 10 * 1024 * 1024;
+
+const TEXT_PREVIEW_MIME_TYPES = new Set([
+  'application/graphql',
+  'application/javascript',
+  'application/json',
+  'application/markdown',
+  'application/toml',
+  'application/xml',
+  'application/yaml',
+  'text/markdown',
+  'text/mdx',
+  'text/x-markdown',
+]);
 
 const normalizeAbsolutePath = (inputPath: string): string =>
   path.normalize(path.isAbsolute(inputPath) ? inputPath : `/${inputPath}`);
@@ -78,6 +126,134 @@ const resolveNearestExistingRealPath = async (targetPath: string): Promise<strin
       if (parentPath === currentPath) return undefined;
       currentPath = parentPath;
     }
+  }
+};
+
+const toPosixRelativePath = (filePath: string) => filePath.split(path.sep).join('/');
+
+const normalizeContentType = (contentType: string): string =>
+  contentType.split(';')[0].trim().toLowerCase();
+
+const isTextPreviewMimeType = (mimeType: string): boolean =>
+  mimeType.startsWith('text/') || TEXT_PREVIEW_MIME_TYPES.has(mimeType);
+
+/** Binary documents the in-app portal can preview (or offer to download). */
+const DOCUMENT_PREVIEW_MIME_TYPES = new Set([
+  'application/msword',
+  'application/pdf',
+  'application/vnd.ms-excel',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+]);
+
+/**
+ * Documents above this raw size fall back to the content-less `binary` / `pdf`
+ * variants: base64 inflates the payload ~4/3 and it must fit in a single
+ * IPC / Gateway RPC response.
+ */
+const MAX_DOCUMENT_PREVIEW_BYTES = 20 * 1024 * 1024;
+
+const serializePreviewFile = ({
+  buffer,
+  contentType,
+  oversized,
+}: {
+  buffer: Buffer;
+  contentType: string;
+  oversized?: boolean;
+}): NonNullable<LocalFilePreviewResult['preview']> => {
+  const normalizedContentType = normalizeContentType(contentType);
+
+  // The protocol manager short-circuited the read (oversized document):
+  // `buffer` is empty by construction, so go straight to the content-less
+  // fallback instead of serializing the empty buffer as a real document.
+  if (oversized) {
+    return normalizedContentType === 'application/pdf'
+      ? { contentType: normalizedContentType, type: 'pdf' }
+      : { contentType: normalizedContentType, type: 'binary' };
+  }
+
+  if (normalizedContentType.startsWith('image/')) {
+    return {
+      base64: buffer.toString('base64'),
+      contentType: normalizedContentType,
+      type: 'image',
+    };
+  }
+
+  if (isTextPreviewMimeType(normalizedContentType)) {
+    return {
+      content: buffer.toString('utf8'),
+      contentType: normalizedContentType,
+      type: 'text',
+    };
+  }
+
+  if (
+    DOCUMENT_PREVIEW_MIME_TYPES.has(normalizedContentType) &&
+    buffer.byteLength <= MAX_DOCUMENT_PREVIEW_BYTES
+  ) {
+    return {
+      base64: buffer.toString('base64'),
+      contentType: normalizedContentType,
+      type: 'document',
+    };
+  }
+
+  if (normalizedContentType === 'application/pdf') {
+    return { contentType: normalizedContentType, type: 'pdf' };
+  }
+
+  if (normalizedContentType.startsWith('video/')) {
+    return { contentType: normalizedContentType, type: 'video' };
+  }
+
+  return { contentType: normalizedContentType, type: 'binary' };
+};
+
+const createProjectFileEntry = (
+  root: string,
+  absolutePath: string,
+  isDirectory: boolean,
+  gitIgnored?: boolean,
+): ProjectFileIndexEntry => {
+  const relativePath = toPosixRelativePath(path.relative(root, absolutePath));
+
+  return {
+    ...(gitIgnored ? { gitIgnored: true } : {}),
+    isDirectory,
+    name: path.basename(absolutePath),
+    path: absolutePath,
+    relativePath: isDirectory ? `${relativePath}/` : relativePath,
+  };
+};
+
+const collectProjectDirectories = (files: string[], root: string): ProjectFileIndexEntry[] => {
+  const directories = new Set<string>();
+
+  for (const filePath of files) {
+    let current = path.dirname(filePath);
+    while (current && current !== root && current.startsWith(`${root}${path.sep}`)) {
+      if (directories.has(current)) break;
+      directories.add(current);
+      current = path.dirname(current);
+    }
+  }
+
+  return [...directories].map((directory) => createProjectFileEntry(root, directory, true));
+};
+
+const createDetectedProjectFileEntry = async (
+  root: string,
+  absolutePath: string,
+): Promise<ProjectFileIndexEntry> => {
+  try {
+    const stats = await stat(absolutePath);
+    return createProjectFileEntry(root, absolutePath, stats.isDirectory());
+  } catch {
+    return createProjectFileEntry(root, absolutePath, false);
   }
 };
 
@@ -138,14 +314,15 @@ export default class LocalFileCtr extends ControllerModule {
     error?: string;
     success: boolean;
   }> {
-    logger.debug('Attempting to open file:', { filePath });
+    const resolvedPath = expandTilde(filePath) ?? filePath;
+    logger.debug('Attempting to open file:', { filePath: resolvedPath });
 
     try {
-      await shell.openPath(filePath);
-      logger.debug('File opened successfully:', { filePath });
+      await shell.openPath(resolvedPath);
+      logger.debug('File opened successfully:', { filePath: resolvedPath });
       return { success: true };
     } catch (error) {
-      logger.error(`Failed to open file ${filePath}:`, error);
+      logger.error(`Failed to open file ${resolvedPath}:`, error);
       return { error: (error as Error).message, success: false };
     }
   }
@@ -155,8 +332,13 @@ export default class LocalFileCtr extends ControllerModule {
     error?: string;
     success: boolean;
   }> {
-    const folderPath = isDirectory ? targetPath : path.dirname(targetPath);
-    logger.debug('Attempting to open folder:', { folderPath, isDirectory, targetPath });
+    const resolvedTarget = expandTilde(targetPath) ?? targetPath;
+    const folderPath = isDirectory ? resolvedTarget : path.dirname(resolvedTarget);
+    logger.debug('Attempting to open folder:', {
+      folderPath,
+      isDirectory,
+      targetPath: resolvedTarget,
+    });
 
     try {
       await shell.openPath(folderPath);
@@ -207,23 +389,13 @@ export default class LocalFileCtr extends ControllerModule {
     const filePath = result.filePaths[0];
     const data = await readFile(filePath);
     const name = path.basename(filePath);
-    const ext = path.extname(filePath).toLowerCase().slice(1);
-
-    const MIME_MAP: Record<string, string> = {
-      avif: 'image/avif',
-      gif: 'image/gif',
-      jpeg: 'image/jpeg',
-      jpg: 'image/jpeg',
-      png: 'image/png',
-      svg: 'image/svg+xml',
-      webp: 'image/webp',
-    };
+    const mimeType = await resolveMimeType(name, data);
 
     return {
       canceled: false,
       file: {
         data: new Uint8Array(data),
-        mimeType: MIME_MAP[ext] || 'application/octet-stream',
+        mimeType,
         name,
       },
     };
@@ -252,14 +424,14 @@ export default class LocalFileCtr extends ControllerModule {
   }
 
   @IpcMethod()
-  async readFiles({ paths }: LocalReadFilesParams): Promise<LocalReadFileResult[]> {
+  async readFiles({ paths, cwd }: LocalReadFilesParams): Promise<LocalReadFileResult[]> {
     logger.debug('Starting batch file reading:', { count: paths.length });
 
     const results: LocalReadFileResult[] = [];
 
     for (const filePath of paths) {
       logger.debug('Reading single file:', { filePath });
-      const result = await readLocalFile({ path: filePath });
+      const result = await readLocalFile({ cwd, path: filePath });
       results.push(result);
     }
 
@@ -274,6 +446,79 @@ export default class LocalFileCtr extends ControllerModule {
       fullContent: params.fullContent,
       loc: params.loc,
     });
+
+    // Image files: `local-file-shell` refuses binary, and the agent should be
+    // able to actually *see* the image (vision) rather than hit "Unsupported
+    // binary file type". Delegate the upload to the embedded CLI
+    // (`lh file upload`) and return a durable { fileId, url } — bytes never
+    // cross IPC and never reach the DB; the MessageContent processor turns
+    // the uploaded URL into an `image_url` part for the LLM.
+    const ext = path.extname(params.path).toLowerCase().replace('.', '');
+    const imageMimeType = LOCAL_IMAGE_EXT_TO_MIME[ext];
+    if (imageMimeType) {
+      const filePath = resolveAgainstCwd(params.path, params.cwd) ?? params.path;
+      const filename = path.basename(filePath);
+
+      const buildImageResult = (
+        content: string,
+        extra: Partial<LocalReadFileResult> = {},
+      ): LocalReadFileResult => ({
+        charCount: 0,
+        content,
+        createdTime: new Date(),
+        fileType: imageMimeType,
+        filename,
+        isImage: true,
+        lineCount: 0,
+        loc: [0, 0],
+        modifiedTime: new Date(),
+        totalCharCount: 0,
+        totalLineCount: 0,
+        ...extra,
+      });
+
+      let fileStat;
+      try {
+        fileStat = await stat(filePath);
+      } catch (error) {
+        return buildImageResult(`Error accessing or processing file: ${(error as Error).message}`);
+      }
+
+      if (!fileStat.isFile()) {
+        return buildImageResult(`Error: Not a regular file: ${filePath}`);
+      }
+
+      if (fileStat.size > MAX_IMAGE_READ_BYTES) {
+        return buildImageResult(
+          `Error: Image file is too large to preview (${fileStat.size} bytes, limit ${MAX_IMAGE_READ_BYTES}).`,
+        );
+      }
+
+      try {
+        const record = await this.app.getService(RemoteFileUploadService).uploadLocalFile(filePath);
+
+        if (record?.url) {
+          return buildImageResult(`[Image: ${filename}]`, {
+            createdTime: fileStat.birthtime,
+            imageFileId: record.id,
+            imageUrl: record.url,
+            modifiedTime: fileStat.mtime,
+          });
+        }
+
+        logger.warn('Image upload returned no record:', { filePath });
+      } catch (error) {
+        logger.warn('Image upload failed:', { error, filePath });
+      }
+
+      // Degrade: the placeholder tells the model an image exists that it
+      // cannot inspect, instead of failing the read outright.
+      return buildImageResult(
+        `[Image: ${filename}] (upload unavailable — the model cannot view this image)`,
+        { createdTime: fileStat.birthtime, modifiedTime: fileStat.mtime },
+      );
+    }
+
     return readLocalFile(params);
   }
 
@@ -286,9 +531,9 @@ export default class LocalFileCtr extends ControllerModule {
   }
 
   @IpcMethod()
-  async handleMoveFiles({ items }: MoveLocalFilesParams): Promise<LocalMoveFilesResultItem[]> {
+  async handleMoveFiles({ items, cwd }: MoveLocalFilesParams): Promise<LocalMoveFilesResultItem[]> {
     logger.debug('Starting batch file move:', { itemsCount: items?.length });
-    return moveLocalFiles({ items });
+    return moveLocalFiles({ cwd, items });
   }
 
   @IpcMethod()
@@ -304,9 +549,9 @@ export default class LocalFileCtr extends ControllerModule {
   }
 
   @IpcMethod()
-  async handleWriteFile({ path: filePath, content }: WriteLocalFileParams) {
+  async handleWriteFile({ path: filePath, content, cwd }: WriteLocalFileParams) {
     logger.debug(`Writing file ${filePath}`, { contentLength: content?.length });
-    return writeLocalFile({ content, path: filePath });
+    return writeLocalFile({ content, cwd, path: filePath });
   }
 
   @IpcMethod()
@@ -322,65 +567,82 @@ export default class LocalFileCtr extends ControllerModule {
   }
 
   @IpcMethod()
-  async handlePrepareSkillDirectory({
-    forceRefresh,
-    url,
-    zipHash,
-  }: PrepareSkillDirectoryParams): Promise<PrepareSkillDirectoryResult> {
-    const cacheRoot = path.join(this.app.appStoragePath, 'file-storage', 'skills');
-    const extractedDir = path.join(cacheRoot, 'extracted', zipHash);
-    const markerPath = path.join(extractedDir, '.prepared');
-    const zipPath = path.join(cacheRoot, 'archives', `${zipHash}.zip`);
-
+  async getLocalFilePreviewUrl({
+    accept,
+    allowExternalFile,
+    path: filePath,
+    resourceScope,
+    workingDirectory,
+  }: LocalFilePreviewUrlParams): Promise<LocalFilePreviewUrlResult> {
     try {
-      if (!forceRefresh) {
-        await access(markerPath, constants.F_OK);
-        return { extractedDir, success: true, zipPath };
-      }
-    } catch {
-      // Cache miss, continue preparing the local copy.
-    }
+      const url = await this.app.localFileProtocolManager.createPreviewUrl({
+        accept,
+        allowExternalFile,
+        filePath,
+        ...(resourceScope && { resourceScope }),
+        workspaceRoot: workingDirectory,
+      });
 
-    try {
-      const response = await netFetch(url);
-      if (!response.ok) {
-        throw new Error(
-          `Failed to download skill package: ${response.status} ${response.statusText}`,
-        );
+      if (!url) {
+        return { error: 'File is outside the approved workspace', success: false };
       }
 
-      const buffer = Buffer.from(await response.arrayBuffer());
-      const extractedFiles = unzipSync(new Uint8Array(buffer));
-
-      await rm(extractedDir, { force: true, recursive: true });
-      await mkdir(path.dirname(zipPath), { recursive: true });
-      await mkdir(extractedDir, { recursive: true });
-      await writeFile(zipPath, buffer);
-
-      for (const [relativePath, fileContent] of Object.entries(extractedFiles)) {
-        if (relativePath.endsWith('/')) continue;
-
-        const targetPath = path.resolve(extractedDir, relativePath);
-        const normalizedRoot = `${path.resolve(extractedDir)}${path.sep}`;
-        if (targetPath !== path.resolve(extractedDir) && !targetPath.startsWith(normalizedRoot)) {
-          throw new Error(`Unsafe file path in skill archive: ${relativePath}`);
-        }
-
-        await mkdir(path.dirname(targetPath), { recursive: true });
-        await writeFile(targetPath, Buffer.from(fileContent as Uint8Array));
-      }
-
-      await writeFile(markerPath, JSON.stringify({ preparedAt: Date.now(), url, zipHash }), 'utf8');
-
-      return { extractedDir, success: true, zipPath };
+      return { success: true, url };
     } catch (error) {
-      return {
-        error: (error as Error).message,
-        extractedDir,
-        success: false,
-        zipPath,
-      };
+      logger.error('Failed to create local file preview URL:', error);
+      return { error: (error as Error).message, success: false };
     }
+  }
+
+  @IpcMethod()
+  async getLocalFilePreview({
+    accept,
+    allowExternalFile,
+    path: filePath,
+    workingDirectory,
+  }: LocalFilePreviewUrlParams): Promise<LocalFilePreviewResult> {
+    try {
+      const preview = await this.app.localFileProtocolManager.readPreviewFile({
+        accept,
+        allowExternalFile,
+        filePath,
+        workspaceRoot: workingDirectory,
+      });
+
+      if (!preview) {
+        return { error: 'File is outside the approved workspace', success: false };
+      }
+
+      return {
+        preview: serializePreviewFile(preview),
+        success: true,
+      };
+    } catch (error) {
+      logger.error('Failed to read local file preview:', error);
+      return { error: (error as Error).message, success: false };
+    }
+  }
+
+  /**
+   * Host deps for the shared skill-archive cache: this keeps the renderer-IPC
+   * path (here) and the gateway RPC path (`GatewayConnectionCtr` →
+   * `@lobechat/device-control`) on ONE cache directory and one proxy-aware
+   * fetch, so a skill prepared by either entry point is a cache hit for the
+   * other.
+   */
+  getSkillDirectoryDeps(): SkillDirectoryDeps {
+    return {
+      fetchSkillArchive: netFetch,
+      skillCacheRoot: path.join(this.app.appStoragePath, 'file-storage', 'skills'),
+    };
+  }
+
+  @IpcMethod()
+  async handlePrepareSkillDirectory(
+    params: PrepareSkillDirectoryParams,
+  ): Promise<PrepareSkillDirectoryResult> {
+    const { prepareSkillDirectory } = await import('@lobechat/device-control/skill-directory');
+    return prepareSkillDirectory(params, this.getSkillDirectoryDeps());
   }
 
   @IpcMethod()
@@ -413,14 +675,196 @@ export default class LocalFileCtr extends ControllerModule {
 
   // ==================== Search & Find ====================
 
+  @IpcMethod()
+  async getProjectFileIndex(params: ProjectFileIndexParams = {}): Promise<ProjectFileIndexResult> {
+    const { execa } = await import('execa');
+    const requestedScope = params.scope || process.cwd();
+    const startedAt = Date.now();
+
+    try {
+      const rootResult = await execa(
+        'git',
+        ['-C', requestedScope, 'rev-parse', '--show-toplevel'],
+        {
+          reject: false,
+          timeout: 5000,
+        },
+      );
+      const root = rootResult.exitCode === 0 ? rootResult.stdout.trim() : requestedScope;
+
+      if (rootResult.exitCode === 0) {
+        const [trackedResult, untrackedResult, ignoredResult] = await Promise.all([
+          execa(
+            'git',
+            ['-C', root, '-c', 'core.quotepath=false', 'ls-files', '--recurse-submodules'],
+            {
+              reject: false,
+              timeout: 10_000,
+            },
+          ),
+          execa(
+            'git',
+            [
+              '-C',
+              root,
+              '-c',
+              'core.quotepath=false',
+              'ls-files',
+              '--others',
+              '--exclude-standard',
+            ],
+            { reject: false, timeout: 10_000 },
+          ),
+          execa(
+            'git',
+            [
+              '-C',
+              root,
+              '-c',
+              'core.quotepath=false',
+              'ls-files',
+              '--others',
+              '--ignored',
+              '--exclude-standard',
+              '--directory',
+            ],
+            { reject: false, timeout: 10_000 },
+          ),
+        ]);
+
+        if (trackedResult.exitCode !== 0) {
+          throw new Error(trackedResult.stderr || 'git ls-files failed');
+        }
+
+        const files = [
+          ...trackedResult.stdout.split('\n'),
+          ...(untrackedResult.exitCode === 0 ? untrackedResult.stdout.split('\n') : []),
+        ]
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .map((relativePath) => path.resolve(root, relativePath));
+
+        const ignoredEntries =
+          ignoredResult.exitCode === 0
+            ? ignoredResult.stdout
+                .split('\n')
+                .map((item) => item.trim())
+                .filter(Boolean)
+                .map((relativePath) => {
+                  const isDirectory = relativePath.endsWith('/');
+                  const normalizedPath = isDirectory ? relativePath.slice(0, -1) : relativePath;
+                  return createProjectFileEntry(
+                    root,
+                    path.resolve(root, normalizedPath),
+                    isDirectory,
+                    true,
+                  );
+                })
+            : [];
+
+        const seen = new Set<string>();
+        const fileEntries = files
+          .filter((filePath) => {
+            if (seen.has(filePath)) return false;
+            seen.add(filePath);
+            return true;
+          })
+          .map((filePath) => createProjectFileEntry(root, filePath, false));
+
+        const uniqueIgnoredEntries = ignoredEntries.filter((entry) => {
+          if (seen.has(entry.path)) return false;
+          seen.add(entry.path);
+          return true;
+        });
+        const indexedPaths = [...fileEntries, ...uniqueIgnoredEntries].map((entry) => entry.path);
+        const entries = [
+          ...collectProjectDirectories(indexedPaths, root),
+          ...fileEntries,
+          ...uniqueIgnoredEntries,
+        ];
+        logger.debug('Project file index built from git', {
+          duration: Date.now() - startedAt,
+          entries: entries.length,
+          files: fileEntries.length,
+          ignored: uniqueIgnoredEntries.length,
+          requestedScope,
+          root,
+        });
+        await this.approveProjectRootForPreview(root);
+
+        return {
+          entries,
+          indexedAt: new Date().toISOString(),
+          root,
+          source: 'git',
+        };
+      }
+    } catch (error) {
+      logger.debug('Git project file index failed, falling back to glob', {
+        error,
+        requestedScope,
+      });
+    }
+
+    const fallback = await this.searchService.glob({
+      limit: PROJECT_FILE_GLOB_LIMIT,
+      pattern: '**/*',
+      scope: requestedScope,
+    });
+    const files = fallback.files.map((filePath) => path.resolve(filePath));
+    const entries = await Promise.all(
+      files.map((filePath) => createDetectedProjectFileEntry(requestedScope, filePath)),
+    );
+
+    logger.debug('Project file index built from glob', {
+      duration: Date.now() - startedAt,
+      entries: entries.length,
+      engine: fallback.engine,
+      requestedScope,
+    });
+    await this.approveProjectRootForPreview(requestedScope);
+
+    return {
+      entries,
+      indexedAt: new Date().toISOString(),
+      root: requestedScope,
+      source: 'glob',
+    };
+  }
+
+  @IpcMethod()
+  async searchProjectFiles(params: ProjectFileSearchParams): Promise<ProjectFileSearchResult> {
+    const startedAt = Date.now();
+    const { defaultSearchProjectFiles } =
+      await import('@lobechat/device-control/project-file-index');
+    const result = await defaultSearchProjectFiles(params);
+
+    logger.debug('Project file search completed', {
+      duration: Date.now() - startedAt,
+      entries: result.entries.length,
+      query: params.query,
+      requestedScope: params.scope,
+      root: result.root,
+      source: result.source,
+    });
+    await this.approveProjectRootForPreview(result.root);
+
+    return result;
+  }
+
   /**
    * Handle IPC event for local file search
    */
   @IpcMethod()
   async handleLocalFilesSearch(params: LocalSearchFilesParams): Promise<FileResult[]> {
+    const effectiveDirectory = expandTilde(params.directory ?? params.scope);
+
     logger.debug('Received file search request:', {
       directory: params.directory,
+      effectiveDirectory,
+      limit: params.limit,
       keywords: params.keywords,
+      scope: params.scope,
     });
 
     // Build search options from params, mapping directory to onlyIn
@@ -436,7 +880,7 @@ export default class LocalFileCtr extends ControllerModule {
       liveUpdate: params.liveUpdate,
       modifiedAfter: params.modifiedAfter ? new Date(params.modifiedAfter) : undefined,
       modifiedBefore: params.modifiedBefore ? new Date(params.modifiedBefore) : undefined,
-      onlyIn: params.directory, // Map directory param to onlyIn option
+      onlyIn: effectiveDirectory,
       sortBy: params.sortBy,
       sortDirection: params.sortDirection,
     };
@@ -446,6 +890,14 @@ export default class LocalFileCtr extends ControllerModule {
       logger.debug('File search completed', {
         count: results.length,
         directory: params.directory,
+        effectiveDirectory,
+        results: results.slice(0, 5).map((result) => ({
+          engine: result.engine,
+          isDirectory: result.isDirectory,
+          name: result.name,
+          path: result.path,
+        })),
+        scope: params.scope,
       });
       return results;
     } catch (error) {
@@ -470,5 +922,13 @@ export default class LocalFileCtr extends ControllerModule {
   async handleEditFile(params: EditLocalFileParams): Promise<EditLocalFileResult> {
     logger.debug(`Editing file ${params.file_path}`, { replace_all: params.replace_all });
     return editLocalFile(params);
+  }
+
+  private async approveProjectRootForPreview(root: string) {
+    try {
+      await this.app.localFileProtocolManager.approveIndexedProjectRoot(root);
+    } catch (error) {
+      logger.error(`Failed to approve project preview root ${root}:`, error);
+    }
   }
 }

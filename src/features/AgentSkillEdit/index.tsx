@@ -3,14 +3,16 @@
 import { isDesktop } from '@lobechat/const';
 import { TITLE_BAR_HEIGHT } from '@lobechat/desktop-bridge';
 import { type SkillResourceTreeNode } from '@lobechat/types';
-import { Button, Drawer, Flexbox } from '@lobehub/ui';
-import { Alert, App, Form as AForm, Popconfirm, Skeleton } from 'antd';
+import { Flexbox } from '@lobehub/ui';
+import { Alert, Button, Drawer, toast } from '@lobehub/ui/base-ui';
+import { Form as AForm, Popconfirm, Skeleton } from 'antd';
 import { createStaticStyles } from 'antd-style';
 import { memo, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import ContentViewer from '@/features/AgentSkillDetail/ContentViewer';
 import FileTree from '@/features/FileTree';
+import { usePermission } from '@/hooks/usePermission';
 import { useToolStore } from '@/store/tool';
 
 import SkillEditForm, { type SkillEditFormValues } from './SkillEditForm';
@@ -59,7 +61,8 @@ const AgentSkillEdit = memo<AgentSkillEditProps>(({ skillId, open, onClose }) =>
   const { t } = useTranslation('setting');
   const { t: tp } = useTranslation('plugin');
   const { t: tc } = useTranslation('common');
-  const { message } = App.useApp();
+
+  const { allowed: canEdit } = usePermission('edit_own_content');
 
   const [selectedFile, setSelectedFile] = useState('SKILL.md');
   const [saving, setSaving] = useState(false);
@@ -84,6 +87,7 @@ const AgentSkillEdit = memo<AgentSkillEditProps>(({ skillId, open, onClose }) =>
   );
 
   const handleSubmit = async (values: SkillEditFormValues) => {
+    if (!canEdit) return;
     setSaving(true);
     try {
       await updateAgentSkill({
@@ -91,7 +95,7 @@ const AgentSkillEdit = memo<AgentSkillEditProps>(({ skillId, open, onClose }) =>
         id: skillId,
         manifest: { description: values.description },
       });
-      message.success(t('agentSkillEdit.saveSuccess'));
+      toast.success(t('agentSkillEdit.saveSuccess'));
       onClose();
     } finally {
       setSaving(false);
@@ -99,8 +103,9 @@ const AgentSkillEdit = memo<AgentSkillEditProps>(({ skillId, open, onClose }) =>
   };
 
   const handleDelete = async () => {
+    if (!canEdit) return;
     await deleteAgentSkill(skillId);
-    message.success(tp('dev.deleteSuccess'));
+    toast.success(tp('dev.deleteSuccess'));
     onClose();
   };
 
@@ -114,15 +119,19 @@ const AgentSkillEdit = memo<AgentSkillEditProps>(({ skillId, open, onClose }) =>
         title={tp('dev.confirmDeleteDevPlugin')}
         okButtonProps={{
           danger: true,
+          disabled: !canEdit,
           type: 'primary',
         }}
         onConfirm={handleDelete}
       >
-        <Button danger>{tc('delete')}</Button>
+        <Button danger disabled={!canEdit}>
+          {tc('delete')}
+        </Button>
       </Popconfirm>
       <Flexbox horizontal gap={12}>
         <Button onClick={onClose}>{tc('cancel')}</Button>
         <Button
+          disabled={!canEdit}
           loading={saving}
           type={'primary'}
           onClick={() => {
@@ -137,7 +146,6 @@ const AgentSkillEdit = memo<AgentSkillEditProps>(({ skillId, open, onClose }) =>
 
   return (
     <Drawer
-      destroyOnHidden
       containerMaxWidth={'auto'}
       footer={footer}
       height={isDesktop ? `calc(100vh - ${TITLE_BAR_HEIGHT}px)` : '100vh'}
@@ -146,13 +154,9 @@ const AgentSkillEdit = memo<AgentSkillEditProps>(({ skillId, open, onClose }) =>
       push={false}
       title={t('agentSkillEdit.title')}
       styles={{
-        body: { padding: 0 },
-        bodyContent: { height: '100%' },
+        bodyContent: { height: '100%', padding: 0 },
       }}
-      onClose={(e) => {
-        e.stopPropagation();
-        onClose();
-      }}
+      onClose={onClose}
     >
       {isLoading ? (
         <Skeleton active paragraph={{ rows: 8 }} style={{ padding: 16 }} />
@@ -181,6 +185,7 @@ const AgentSkillEdit = memo<AgentSkillEditProps>(({ skillId, open, onClose }) =>
               }}
             >
               <SkillEditForm
+                disabled={!canEdit}
                 form={form}
                 initialValues={initialValues}
                 name={skillDetail?.name}

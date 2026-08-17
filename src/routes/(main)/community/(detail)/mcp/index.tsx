@@ -2,7 +2,7 @@
 
 import { Flexbox } from '@lobehub/ui';
 import { memo } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams } from 'react-router';
 
 import { DetailProvider } from '@/features/MCPPluginDetail/DetailProvider';
 import Header from '@/features/MCPPluginDetail/Header';
@@ -44,8 +44,8 @@ const McpDetailPage = memo<McpDetailPageProps>(({ mobile }) => {
   );
 });
 
-export const MobileMcpPage = memo<{ mobile?: boolean }>(() => {
+export const MobileMcpPage = (_props: { mobile?: boolean }) => {
   return <McpDetailPage mobile={true} />;
-});
+};
 
 export default McpDetailPage;

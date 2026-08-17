@@ -1,12 +1,36 @@
 import { type UIChatMessage } from '@lobechat/types';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as isCanUseFCModule from '@/helpers/isCanUseFC';
+import { agentService } from '@/services/agent';
 import { agentDocumentService } from '@/services/agentDocument';
+import { useAgentStore } from '@/store/agent';
 
 import * as helpers from '../helper';
 import { contextEngineering } from './contextEngineering';
 import * as memoryManager from './memoryManager';
+
+vi.hoisted(() => {
+  const storage = new Map<string, string>();
+
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      clear: () => storage.clear(),
+      getItem: (key: string) => storage.get(key) ?? null,
+      key: (index: number) => Array.from(storage.keys())[index] ?? null,
+      get length() {
+        return storage.size;
+      },
+      removeItem: (key: string) => {
+        storage.delete(key);
+      },
+      setItem: (key: string, value: string) => {
+        storage.set(key, value);
+      },
+    },
+  });
+});
 
 // Mock VARIABLE_GENERATORS
 vi.mock('@/helpers/parserPlaceholder', () => ({
@@ -24,22 +48,42 @@ vi.mock('@/services/agentDocument', () => ({
   },
 }));
 
-// 默认设置 isServerMode 为 false
-let isServerMode = false;
+vi.mock('@/services/agent', () => ({
+  AVAILABLE_AGENTS_CONTEXT_LIMIT: 10,
+  AVAILABLE_AGENTS_CONTEXT_QUERY_LIMIT: 12,
+  agentService: {
+    queryAgents: vi.fn(),
+  },
+}));
+
+// 默认设置运行环境为 browser/client
+const runtimeFlags = vi.hoisted(() => ({
+  isServerMode: false,
+}));
 
 vi.mock('@lobechat/const', async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...(actual as any),
     get isServerMode() {
-      return isServerMode;
+      return runtimeFlags.isServerMode;
     },
-    isDeprecatedEdition: false,
     isDesktop: false,
+    isDeprecatedEdition: false,
   };
 });
 
+beforeEach(() => {
+  vi.mocked(agentService.queryAgents).mockResolvedValue([]);
+  useAgentStore.setState({
+    activeAgentId: undefined,
+    agentMap: {},
+    availableAgents: undefined,
+  });
+});
+
 afterEach(() => {
+  runtimeFlags.isServerMode = false;
   vi.resetModules();
   vi.clearAllMocks();
 });
@@ -77,6 +121,9 @@ describe('contextEngineering', () => {
           content: 'Project setup steps',
           filename: 'setup.md',
           id: 'doc-1',
+          // `always` keeps this doc in the inline bucket; without it the
+          // default is progressive (metadata-only index, content hidden).
+          policyLoad: 'always',
           title: 'Setup',
         },
       ],
@@ -100,9 +147,153 @@ describe('contextEngineering', () => {
     });
   });
 
+  it('should suppress agent documents when runtime agent mode is disabled', async () => {
+    const output = await contextEngineering({
+      agentDocuments: [
+        {
+          content: 'Project setup steps',
+          filename: 'setup.md',
+          id: 'doc-1',
+          policyLoad: 'always',
+          title: 'Setup',
+        },
+      ],
+      agentId: 'agent-1',
+      enableAgentMode: false,
+      messages: [{ content: 'Summarize the setup', role: 'user' }] as UIChatMessage[],
+      model: 'gpt-4',
+      provider: 'openai',
+    });
+
+    // Example: image-only models force chat mode for this request, so agent
+    // documents must not leak into the prompt while the stored config stays true.
+    const documentsMessage = output.find(
+      (message) =>
+        message.role === 'user' &&
+        typeof message.content === 'string' &&
+        message.content.includes('Project setup steps'),
+    );
+
+    expect(documentsMessage).toBeUndefined();
+  });
+
+  it('should fall back to stored chat mode when runtime agent mode is omitted', async () => {
+    useAgentStore.setState({
+      activeAgentId: 'agent-1',
+      agentMap: {
+        'agent-1': {
+          chatConfig: { enableAgentMode: false },
+        },
+      },
+    });
+
+    const output = await contextEngineering({
+      agentDocuments: [
+        {
+          content: 'Project setup steps',
+          filename: 'setup.md',
+          id: 'doc-1',
+          policyLoad: 'always',
+          title: 'Setup',
+        },
+      ],
+      messages: [{ content: 'Summarize the setup', role: 'user' }] as UIChatMessage[],
+      model: 'gpt-4',
+      provider: 'openai',
+    });
+
+    // Example: preset-task calls do not pass runtime mode, but explicit stored
+    // Chat mode should still suppress agent-document context.
+    const documentsMessage = output.find(
+      (message) =>
+        message.role === 'user' &&
+        typeof message.content === 'string' &&
+        message.content.includes('Project setup steps'),
+    );
+
+    expect(documentsMessage).toBeUndefined();
+  });
+
+  it('should use cached available agents without querying during context engineering', async () => {
+    useAgentStore.setState({
+      availableAgents: [
+        {
+          avatar: null,
+          backgroundColor: null,
+          description: null,
+          id: 'agent-1',
+          name: null,
+          title: 'Current Agent',
+        },
+        {
+          avatar: null,
+          backgroundColor: null,
+          description: 'Helps with setup',
+          id: 'agent-2',
+          name: null,
+          title: 'Setup Agent',
+        },
+      ],
+    });
+
+    await contextEngineering({
+      agentId: 'agent-1',
+      messages: [{ content: 'Hello', role: 'user' }] as UIChatMessage[],
+      model: 'gpt-4',
+      provider: 'openai',
+    });
+
+    expect(agentService.queryAgents).not.toHaveBeenCalled();
+  });
+
+  it('should query available agents when the prefetch cache is missing', async () => {
+    await contextEngineering({
+      agentId: 'agent-1',
+      messages: [{ content: 'Hello', role: 'user' }] as UIChatMessage[],
+      model: 'gpt-4',
+      provider: 'openai',
+    });
+
+    expect(agentService.queryAgents).toHaveBeenCalledWith({ limit: 12 });
+  });
+
+  it('should inject runtime model knowledge cutoff', async () => {
+    vi.spyOn(helpers, 'getRuntimeModelKnowledgeCutoff').mockReturnValue('2024-06');
+
+    const output = await contextEngineering({
+      messages: [{ content: 'Hello', role: 'user' }] as UIChatMessage[],
+      model: 'gpt-4',
+      provider: 'openai',
+      systemRole: 'You are a helpful assistant',
+    });
+
+    expect(helpers.getRuntimeModelKnowledgeCutoff).toHaveBeenCalledWith('gpt-4', 'openai');
+    expect(output[0]).toEqual({
+      content: expect.stringContaining('Model knowledge cutoff: 2024-06'),
+      role: 'system',
+    });
+  });
+
+  it('should inject runtime model name and id', async () => {
+    vi.spyOn(helpers, 'getRuntimeModelDisplayName').mockReturnValue('Fable 5');
+
+    const output = await contextEngineering({
+      messages: [{ content: 'Hello', role: 'user' }] as UIChatMessage[],
+      model: 'claude-fable-5',
+      provider: 'lobehub',
+      systemRole: 'You are a helpful assistant',
+    });
+
+    expect(helpers.getRuntimeModelDisplayName).toHaveBeenCalledWith('claude-fable-5', 'lobehub');
+    expect(output[0]).toEqual({
+      content: expect.stringContaining('Current model: Fable 5 (claude-fable-5)'),
+      role: 'system',
+    });
+  });
+
   describe('handle with files content in server mode', () => {
     it('should includes files', async () => {
-      isServerMode = true;
+      runtimeFlags.isServerMode = true;
       // Mock isCanUseVision to return true for vision models
       vi.spyOn(helpers, 'isCanUseVision').mockReturnValue(true);
 
@@ -159,7 +350,7 @@ describe('contextEngineering', () => {
 <files_info>
 <images>
 <images_docstring>here are user upload images you can refer to</images_docstring>
-<image name="ttt.png" url="http://example.com/xxx0asd-dsd.png"></image>
+<image ref="image_1" name="ttt.png" url="http://example.com/xxx0asd-dsd.png"></image>
 </images>
 <files>
 <files_docstring>here are user upload files you can refer to</files_docstring>
@@ -183,11 +374,11 @@ describe('contextEngineering', () => {
         },
       ]);
 
-      isServerMode = false;
+      runtimeFlags.isServerMode = false;
     });
 
     it('should include image files in server mode', async () => {
-      isServerMode = true;
+      runtimeFlags.isServerMode = true;
 
       vi.spyOn(helpers, 'isCanUseVision').mockReturnValue(false);
 
@@ -218,10 +409,10 @@ describe('contextEngineering', () => {
             {
               // Vision disabled: the image is surfaced in the file-context
               // block AND appended as a textual placeholder so the target
-              // model still sees that an image was sent (see LOBE-7214).
+              // model still sees that an image was sent (see ).
               text: `Hello
 
-[image omitted: not supported by this model]
+[image omitted: native vision is not supported. Do not infer or describe the image. If the request depends on it, use an available visual-analysis tool before answering; otherwise state that the image cannot be inspected.]
 
 <!-- SYSTEM CONTEXT (NOT PART OF USER QUERY) -->
 <context.instruction>following part contains context information injected by the system. Please follow these instructions:
@@ -232,7 +423,7 @@ describe('contextEngineering', () => {
 <files_info>
 <images>
 <images_docstring>here are user upload images you can refer to</images_docstring>
-<image name="abc.png" url="http://example.com/image.jpg"></image>
+<image ref="image_1" name="abc.png" url="http://example.com/image.jpg"></image>
 </images>
 </files_info>
 <!-- END SYSTEM CONTEXT -->`,
@@ -247,7 +438,7 @@ describe('contextEngineering', () => {
         },
       ]);
 
-      isServerMode = false;
+      runtimeFlags.isServerMode = false;
     });
   });
 
@@ -672,7 +863,7 @@ describe('contextEngineering', () => {
     });
 
     it('should process placeholder variables combined with other processors', async () => {
-      isServerMode = true;
+      runtimeFlags.isServerMode = true;
       vi.spyOn(helpers, 'isCanUseVision').mockReturnValue(true);
 
       const messages: UIChatMessage[] = [
@@ -715,7 +906,7 @@ describe('contextEngineering', () => {
       expect(content[1].type).toBe('image_url');
       expect(content[1].image_url.url).toBe('http://example.com/test.jpg');
 
-      isServerMode = false;
+      runtimeFlags.isServerMode = false;
     });
   });
 

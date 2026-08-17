@@ -8,8 +8,10 @@ import { useTranslation } from 'react-i18next';
 
 import type { TaskListItem } from '@/store/task/slices/list/initialState';
 
+import type { TaskItemRouteScope } from '../features/AgentTaskItem';
 import AgentTaskItem from '../features/AgentTaskItem';
 import TaskStatusIcon from '../features/TaskStatusIcon';
+import TaskItemSkeleton from './TaskItemSkeleton';
 
 export const COLUMN_WIDTH = 300;
 
@@ -40,23 +42,25 @@ const cardStyles = createStaticStyles(({ css, cssVar }) => ({
   `,
 }));
 
-const DraggableTaskCard = memo<{ task: TaskListItem }>(({ task }) => {
-  const { attributes, isDragging, listeners, setNodeRef } = useDraggable({
-    data: { task },
-    id: task.identifier,
-  });
+const DraggableTaskCard = memo<{ routeScope?: TaskItemRouteScope; task: TaskListItem }>(
+  ({ routeScope, task }) => {
+    const { attributes, isDragging, listeners, setNodeRef } = useDraggable({
+      data: { task },
+      id: task.identifier,
+    });
 
-  return (
-    <div
-      className={cx(cardStyles.card, isDragging && cardStyles.dragging)}
-      ref={setNodeRef}
-      {...listeners}
-      {...attributes}
-    >
-      <AgentTaskItem task={task} variant="compact" />
-    </div>
-  );
-});
+    return (
+      <div
+        className={cx(cardStyles.card, isDragging && cardStyles.dragging)}
+        ref={setNodeRef}
+        {...listeners}
+        {...attributes}
+      >
+        <AgentTaskItem routeScope={routeScope} task={task} variant="compact" />
+      </div>
+    );
+  },
+);
 
 const styles = createStaticStyles(({ css, cssVar }) => ({
   action: css`
@@ -168,14 +172,16 @@ export const COLUMN_STATUS_ICON: Record<string, TaskStatus> = {
 interface KanbanColumnProps {
   columnKey: string;
   droppable: boolean;
+  loading?: boolean;
   onCreate?: () => void;
   onHide?: () => void;
+  routeScope?: TaskItemRouteScope;
   tasks: TaskListItem[];
   total: number;
 }
 
 const KanbanColumn = memo<KanbanColumnProps>(
-  ({ columnKey, droppable, onCreate, onHide, tasks, total }) => {
+  ({ columnKey, droppable, loading, onCreate, onHide, routeScope, tasks, total }) => {
     const { t } = useTranslation('chat');
     const { active } = useDndContext();
     const { isOver, setNodeRef } = useDroppable({
@@ -222,9 +228,11 @@ const KanbanColumn = memo<KanbanColumnProps>(
         <div className={styles.header}>
           {statusIcon && <TaskStatusIcon size={18} status={statusIcon} />}
           <Text weight={500}>{label}</Text>
-          <Text fontSize={12} type={'secondary'}>
-            {total}
-          </Text>
+          {!loading && (
+            <Text fontSize={12} type={'secondary'}>
+              {total}
+            </Text>
+          )}
           <div className={cx(styles.headerActions, 'kanban-col-action')}>
             {menuItems.length > 0 && (
               <DropdownMenu items={menuItems}>
@@ -242,8 +250,16 @@ const KanbanColumn = memo<KanbanColumnProps>(
           </div>
         </div>
         <div className={styles.body}>
-          {tasks.length > 0 ? (
-            tasks.map((task) => <DraggableTaskCard key={task.identifier} task={task} />)
+          {loading ? (
+            Array.from({ length: 3 }).map((_, index) => (
+              <div className={cardStyles.card} key={`kanban-skeleton-${columnKey}-${index}`}>
+                <TaskItemSkeleton variant={'compact'} />
+              </div>
+            ))
+          ) : tasks.length > 0 ? (
+            tasks.map((task) => (
+              <DraggableTaskCard key={task.identifier} routeScope={routeScope} task={task} />
+            ))
           ) : onCreate ? (
             <div className={styles.addPill} title={t('taskList.kanban.addTask')} onClick={onCreate}>
               <Icon icon={Plus} size={16} />

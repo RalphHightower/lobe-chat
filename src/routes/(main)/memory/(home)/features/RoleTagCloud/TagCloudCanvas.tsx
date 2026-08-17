@@ -1,4 +1,5 @@
 import { Billboard, Html, OrbitControls, Text } from '@react-three/drei';
+import type { ThreeEvent } from '@react-three/fiber';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { useTheme } from 'antd-style';
 import { memo, Suspense, useEffect, useMemo, useRef, useState } from 'react';
@@ -65,7 +66,7 @@ const Word = memo<WordProps>(
         <Text
           ref={ref}
           onPointerOut={() => setHovered(false)}
-          onPointerOver={(e) => {
+          onPointerOver={(e: ThreeEvent<PointerEvent>) => {
             e.stopPropagation();
             setHovered(true);
           }}
@@ -266,12 +267,12 @@ const ConnectionLine = memo<ConnectionLineProps>(
   },
 );
 
-// Center avatar component
-const CenterAvatar = memo(() => {
+const CenterAvatar = () => {
   return (
     <Html
       center
       position={[0, 0, 0]}
+      zIndexRange={[10, 0]}
       style={{
         pointerEvents: 'none',
       }}
@@ -279,7 +280,7 @@ const CenterAvatar = memo(() => {
       <UserAvatar shape={'circle'} size={80} />
     </Html>
   );
-});
+};
 
 interface CloudProps {
   radius?: number;

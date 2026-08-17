@@ -1,26 +1,45 @@
-import { lambdaClient } from '@/libs/trpc/client';
 import type {
-  AgentSignalSourcePayloadMap,
+  AgentSignalSourceEventInput,
   AgentSignalSourceType,
-} from '@/server/services/agentSignal/sourceTypes';
+} from '@lobechat/agent-signal/source';
+
+import { lambdaClient } from '@/libs/trpc/client';
 
 type ClientGatewaySourceType = Extract<AgentSignalSourceType, `client.${string}`>;
 
-type ClientGatewaySourceEnvelopeInput<TSourceType extends ClientGatewaySourceType> = {
-  payload: AgentSignalSourcePayloadMap[TSourceType];
-  scopeKey?: string;
-  sourceId: string;
-  sourceType: TSourceType;
-  timestamp?: number;
-};
+type ClientGatewaySourceEventInput<TSourceType extends ClientGatewaySourceType> =
+  AgentSignalSourceEventInput<TSourceType>;
+
+export interface ListAgentSignalReceiptsParams {
+  agentId: string;
+  cursor?: number;
+  limit?: number;
+  sinceCreatedAt?: number;
+  topicId: string;
+}
+
+export interface RollbackAgentSignalReceiptParams {
+  agentDocumentId?: string;
+  documentId: string;
+  historyId: string;
+  receiptId: string;
+}
 
 class AgentSignalService {
-  emitSourceEvent = async (payload: ClientGatewaySourceEnvelopeInput<ClientGatewaySourceType>) => {
+  listReceipts = async (params: ListAgentSignalReceiptsParams) => {
+    return lambdaClient.agentSignal.listReceipts.query(params);
+  };
+
+  rollbackReceipt = async (params: RollbackAgentSignalReceiptParams) => {
+    return lambdaClient.agentSignal.rollbackReceipt.mutate(params);
+  };
+
+  emitSourceEvent = async (payload: ClientGatewaySourceEventInput<ClientGatewaySourceType>) => {
     return lambdaClient.agentSignal.emitSourceEvent.mutate(payload);
   };
 
   emitClientGatewaySourceEvent = async <TSourceType extends ClientGatewaySourceType>(
-    payload: ClientGatewaySourceEnvelopeInput<TSourceType>,
+    payload: ClientGatewaySourceEventInput<TSourceType>,
   ) => {
     return this.emitSourceEvent({
       ...payload,

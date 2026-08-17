@@ -76,7 +76,7 @@ const ClientTaskItem = memo<ClientTaskItemProps>(({ item }) => {
   );
 
   // Fetch thread messages (skip when executing - messages come from real-time updates)
-  useFetchMessages(threadContext, isProcessing);
+  useFetchMessages(threadContext, { skipFetch: isProcessing });
 
   // Get thread messages from store using selector
   const threadMessages = useChatStore((s) =>
@@ -100,7 +100,10 @@ const ClientTaskItem = memo<ClientTaskItemProps>(({ item }) => {
       const toolCalls = blocks.reduce((sum, block) => sum + (block.tools?.length || 0), 0);
       return {
         isLoading: false,
-        startTime: assistantGroupMessage?.createdAt,
+        // Anchor elapsed time to the task tool's createdAt (when the sub-agent was
+        // invoked) rather than the in-thread first assistant's createdAt (when the
+        // thread finished initializing) — the latter excludes init / approval wait.
+        startTime: item.createdAt,
         steps: blocks.length,
         toolCalls,
       };
@@ -118,7 +121,7 @@ const ClientTaskItem = memo<ClientTaskItemProps>(({ item }) => {
     isCompleted,
     isError,
     blocks,
-    assistantGroupMessage?.createdAt,
+    item.createdAt,
     taskDetail?.duration,
     taskDetail?.totalSteps,
     taskDetail?.totalToolCalls,
@@ -167,7 +170,7 @@ const ClientTaskItem = memo<ClientTaskItemProps>(({ item }) => {
             messages={threadMessages}
             model={model ?? undefined}
             provider={provider ?? undefined}
-            startTime={assistantGroupMessage?.createdAt}
+            startTime={item.createdAt}
             totalCost={taskDetail?.totalCost}
           />
         )}

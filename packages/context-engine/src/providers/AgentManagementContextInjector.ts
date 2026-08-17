@@ -66,8 +66,12 @@ export interface AvailablePluginInfo {
   identifier: string;
   /** Plugin display name */
   name: string;
-  /** Plugin type: 'builtin' for built-in tools, 'klavis' for Klavis servers, 'lobehub-skill' for LobehubSkill providers */
-  type: 'builtin' | 'klavis' | 'lobehub-skill';
+  /**
+   * Plugin source: 'builtin' for built-in tools, 'composio' for Composio servers,
+   * 'lobehub-skill' for LobehubSkill providers, 'custom' for user-added custom
+   * MCP connectors (aligns with ConnectorSourceType.custom).
+   */
+  type: 'builtin' | 'composio' | 'lobehub-skill' | 'custom';
 }
 
 /**
@@ -163,8 +167,9 @@ const defaultFormatContext = (context: AgentManagementContext): string => {
   // Add available plugins section
   if (context.availablePlugins && context.availablePlugins.length > 0) {
     const builtinPlugins = context.availablePlugins.filter((p) => p.type === 'builtin');
-    const klavisPlugins = context.availablePlugins.filter((p) => p.type === 'klavis');
+    const composioPlugins = context.availablePlugins.filter((p) => p.type === 'composio');
     const lobehubSkillPlugins = context.availablePlugins.filter((p) => p.type === 'lobehub-skill');
+    const customPlugins = context.availablePlugins.filter((p) => p.type === 'custom');
 
     const pluginsSections: string[] = [];
 
@@ -178,14 +183,14 @@ const defaultFormatContext = (context: AgentManagementContext): string => {
       pluginsSections.push(`  <builtin_plugins>\n${builtinItems}\n  </builtin_plugins>`);
     }
 
-    if (klavisPlugins.length > 0) {
-      const klavisItems = klavisPlugins
+    if (composioPlugins.length > 0) {
+      const composioItems = composioPlugins
         .map((p) => {
           const desc = p.description ? ` - ${escapeXml(p.description)}` : '';
           return `    <plugin id="${p.identifier}">${escapeXml(p.name)}${desc}</plugin>`;
         })
         .join('\n');
-      pluginsSections.push(`  <klavis_plugins>\n${klavisItems}\n  </klavis_plugins>`);
+      pluginsSections.push(`  <composio_plugins>\n${composioItems}\n  </composio_plugins>`);
     }
 
     if (lobehubSkillPlugins.length > 0) {
@@ -198,6 +203,16 @@ const defaultFormatContext = (context: AgentManagementContext): string => {
       pluginsSections.push(
         `  <lobehub_skill_plugins>\n${lobehubSkillItems}\n  </lobehub_skill_plugins>`,
       );
+    }
+
+    if (customPlugins.length > 0) {
+      const customItems = customPlugins
+        .map((p) => {
+          const desc = p.description ? ` - ${escapeXml(p.description)}` : '';
+          return `    <plugin id="${p.identifier}">${escapeXml(p.name)}${desc}</plugin>`;
+        })
+        .join('\n');
+      pluginsSections.push(`  <custom_plugins>\n${customItems}\n  </custom_plugins>`);
     }
 
     if (pluginsSections.length > 0) {
@@ -249,7 +264,7 @@ const formatMentionedAgentsContext = (mentionedAgents: RuntimeMentionedAgent[]):
     .join('\n');
 
   return `<mentioned_agents>
-<instruction>The user has @mentioned the following agent(s) in their message. You MUST call the \`lobe-agent-management____callAgent____builtin\` tool to delegate the user's request to the mentioned agent. Do NOT attempt to handle the request yourself — call the agent and let them respond.</instruction>
+<instruction>The user has @mentioned the following agent(s) in their message. You MUST call the \`lobe-agent-management____callAgent\` tool to delegate the user's request to the mentioned agent. Do NOT attempt to handle the request yourself — call the agent and let them respond.</instruction>
 ${agentsXml}
 </mentioned_agents>`;
 };

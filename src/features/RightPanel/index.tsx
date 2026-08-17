@@ -3,7 +3,7 @@ import { DraggablePanel } from '@lobehub/ui';
 import { cssVar } from 'antd-style';
 import { memo, Suspense, useState } from 'react';
 
-import Loading from '@/components/Loading/BrandTextLoading';
+import SurfaceSkeleton from '@/components/Skeleton/Surface';
 import { useGlobalStore } from '@/store/global';
 import { systemStatusSelectors } from '@/store/global/selectors';
 
@@ -14,25 +14,52 @@ export interface Size {
 
 interface RightPanelProps extends Omit<
   DraggablePanelProps,
-  'placement' | 'size' | 'onSizeChange' | 'onExpandChange'
+  'placement' | 'size' | 'onSizeChange' | 'onExpandChange' | 'expand'
 > {
   defaultWidth?: number | string;
+  /**
+   * Override the panel's expanded state. When provided together with `onExpandChange`,
+   * the panel uses these instead of the global `showRightPanel` store. This lets each
+   * surface (Page editor, Task layout, etc.) own an independent visibility state.
+   */
+  expand?: boolean;
+  onExpandChange?: (expand: boolean) => void;
   onSizeChange?: (size?: Size) => void;
+  /**
+   * Controlled width. When provided, the parent owns the width (and should keep
+   * it in sync via `onSizeChange` on drag). Omit for the default self-managed
+   * behaviour seeded by `defaultWidth`.
+   */
+  width?: number | string;
 }
 
 const RightPanel = memo<RightPanelProps>(
-  ({ maxWidth = 600, minWidth = 300, children, defaultWidth = 360, onSizeChange, ...rest }) => {
-    const [showRightPanel, toggleRightPanel] = useGlobalStore((s) => [
+  ({
+    maxWidth = 600,
+    minWidth = 300,
+    children,
+    defaultWidth = 360,
+    expand: expandProp,
+    onExpandChange,
+    onSizeChange,
+    width: widthProp,
+    ...rest
+  }) => {
+    const [globalExpand, globalToggle] = useGlobalStore((s) => [
       systemStatusSelectors.showRightPanel(s),
       s.toggleRightPanel,
     ]);
 
-    const [width, setWidth] = useState<string | number>(defaultWidth);
+    const expand = expandProp ?? globalExpand;
+    const handleExpandChange = onExpandChange ?? ((next: boolean) => globalToggle(next));
+
+    const [internalWidth, setInternalWidth] = useState<string | number>(defaultWidth);
+    const width = widthProp ?? internalWidth;
 
     return (
       <DraggablePanel
         backgroundColor={cssVar.colorBgContainer}
-        expand={showRightPanel}
+        expand={expand}
         expandable={false}
         maxWidth={maxWidth}
         minWidth={minWidth}
@@ -41,16 +68,18 @@ const RightPanel = memo<RightPanelProps>(
           height: '100%',
           width,
         }}
-        onExpandChange={(expand) => toggleRightPanel(expand)}
+        onExpandChange={handleExpandChange}
         onSizeChange={(_, size) => {
           if (size?.width) {
-            setWidth(size.width);
+            setInternalWidth(size.width);
           }
           if (size) onSizeChange?.(size);
         }}
         {...rest}
       >
-        <Suspense fallback={<Loading debugId={'RightPanel'} />}>{children}</Suspense>
+        <Suspense fallback={<SurfaceSkeleton header={false} variant={'list'} />}>
+          {children}
+        </Suspense>
       </DraggablePanel>
     );
   },

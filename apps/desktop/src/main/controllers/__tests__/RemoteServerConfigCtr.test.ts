@@ -26,6 +26,9 @@ vi.mock('@/utils/logger', () => ({
 
 // Mock electron
 vi.mock('electron', () => ({
+  app: {
+    getVersion: vi.fn(() => '1.2.3'),
+  },
   ipcMain: {
     handle: ipcMainHandleMock,
   },
@@ -178,6 +181,30 @@ describe('RemoteServerConfigCtr', () => {
           refreshToken: 'refresh-token',
         }),
       );
+    });
+  });
+
+  describe('getDesktopBootstrapIdentity', () => {
+    const createAccessToken = (sub: string) =>
+      ['header', Buffer.from(JSON.stringify({ sub })).toString('base64url'), 'signature'].join('.');
+
+    it('returns the OIDC subject without requesting full user state', async () => {
+      await controller.saveTokens(createAccessToken('user-bootstrap'), 'refresh-token');
+
+      expect(controller.getDesktopBootstrapIdentity()).toEqual({
+        isIdentityResolved: true,
+        userId: 'user-bootstrap',
+      });
+    });
+
+    it('resolves to signed-out when no encrypted token exists', () => {
+      expect(controller.getDesktopBootstrapIdentity()).toEqual({ isIdentityResolved: true });
+    });
+
+    it('keeps the cache scope untrusted when the stored token cannot identify a subject', async () => {
+      await controller.saveTokens('not-a-jwt', 'refresh-token');
+
+      expect(controller.getDesktopBootstrapIdentity()).toEqual({ isIdentityResolved: false });
     });
   });
 
@@ -499,6 +526,9 @@ describe('RemoteServerConfigCtr', () => {
         'https://server.com/oidc/token',
         expect.objectContaining({
           body: expect.stringContaining('grant_type=refresh_token'),
+          headers: expect.objectContaining({
+            'User-Agent': 'LobeHub Desktop/1.2.3',
+          }),
           method: 'POST',
         }),
       );
@@ -535,6 +565,7 @@ describe('RemoteServerConfigCtr', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Token refresh failed');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
     it('should handle missing tokens in response', async () => {
@@ -618,7 +649,7 @@ describe('RemoteServerConfigCtr', () => {
       expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
-    it('should handle network errors with retry', async () => {
+    it('should not retry after a network error', async () => {
       const { safeStorage } = await import('electron');
       vi.mocked(safeStorage.isEncryptionAvailable).mockReturnValue(true);
       vi.mocked(safeStorage.decryptString).mockImplementation((buffer: Buffer) =>
@@ -644,9 +675,8 @@ describe('RemoteServerConfigCtr', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Network error');
-      // With retry mechanism, fetch should be called 4 times (1 initial + 3 retries)
-      expect(mockFetch).toHaveBeenCalledTimes(4);
-    }, 15000);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('afterAppReady', () => {

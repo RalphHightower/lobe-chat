@@ -1,9 +1,12 @@
 import { ChatInput, Editor, SendButton, useEditor } from '@lobehub/editor/react';
-import { Button, Flexbox } from '@lobehub/ui';
+import { Flexbox } from '@lobehub/ui';
+import { Button } from '@lobehub/ui/base-ui';
 import { cssVar } from 'antd-style';
 import { ChevronLeft } from 'lucide-react';
 import { memo, useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+
+import { useEnterToSend } from '@/hooks/useEnterToSend';
 
 interface CommentInputProps {
   onCancel: () => void;
@@ -14,6 +17,7 @@ const CommentInput = memo<CommentInputProps>(({ onSubmit, onCancel }) => {
   const { t } = useTranslation('home');
   const editor = useEditor();
   const [submitting, setSubmitting] = useState(false);
+  const shouldSendOnEnter = useEnterToSend();
 
   const handleSubmit = useCallback(async () => {
     const content = String(editor?.getDocument?.('markdown') ?? '').trim();
@@ -65,7 +69,7 @@ const CommentInput = memo<CommentInputProps>(({ onSubmit, onCancel }) => {
         type={'text'}
         variant={'chat'}
         onPressEnter={({ event }) => {
-          if (event.metaKey || event.ctrlKey) {
+          if (shouldSendOnEnter(event)) {
             handleSubmit();
             return true;
           }

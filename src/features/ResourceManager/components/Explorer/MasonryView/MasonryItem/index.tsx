@@ -1,23 +1,34 @@
-import { Checkbox, showContextMenu, stopPropagation } from '@lobehub/ui';
+import {
+  CUSTOM_DOCUMENT_FILE_TYPE,
+  CUSTOM_FOLDER_FILE_TYPE,
+  MARKDOWN_MIME_TYPES,
+} from '@lobechat/const';
+import { stopPropagation } from '@lobehub/ui';
+import { Checkbox } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar, cx } from 'antd-style';
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import {
   getTransparentDragImage,
   useDragActive,
   useSetCurrentDrag,
-} from '@/routes/(main)/resource/features/DndContextWrapper';
+} from '@/features/ResourceManager/DndContextWrapper';
+import { showContextMenu } from '@/libs/contextMenu';
 import { documentService } from '@/services/document';
-import { useFileStore } from '@/store/file';
+import { getChunkTargetId, useFileStore } from '@/store/file';
 import { type FileListItem } from '@/types/files';
 
 import { useFileItemClick } from '../../hooks/useFileItemClick';
 import DropdownMenu from '../../ItemDropdown/DropdownMenu';
 import { useFileItemDropdown } from '../../ItemDropdown/useFileItemDropdown';
+import AudioFileItem from './AudioFileItem';
 import DefaultFileItem from './DefaultFileItem';
 import ImageFileItem from './ImageFileItem';
 import MarkdownFileItem from './MarkdownFileItem';
 import NoteFileItem from './NoteFileItem';
+import VideoFileItem from './VideoFileItem';
+import WebpageFileItem from './WebpageFileItem';
 
 // Image file types
 const IMAGE_TYPES = new Set([
@@ -30,10 +41,10 @@ const IMAGE_TYPES = new Set([
 ]);
 
 // Markdown file types
-const MARKDOWN_TYPES = new Set(['text/markdown', 'text/x-markdown']);
+const MARKDOWN_TYPES = new Set(MARKDOWN_MIME_TYPES);
 
 // Custom note file type
-const CUSTOM_NOTE_TYPE = 'custom/document';
+const CUSTOM_NOTE_TYPE = CUSTOM_DOCUMENT_FILE_TYPE;
 
 // Helper to check if filename ends with .md or is a custom note
 const isMarkdownFile = (name: string, fileType?: string) => {
@@ -176,6 +187,7 @@ interface MasonryFileItemProps extends FileListItem {
   knowledgeBaseId?: string;
   onOpen?: (id: string) => void;
   onSelectedChange: (id: string, selected: boolean) => void;
+  selectable?: boolean;
   selected?: boolean;
   slug?: string | null;
 }
@@ -187,11 +199,14 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
     embeddingStatus,
     finishEmbedding,
     chunkCount,
+    content,
     url,
     name,
     fileType,
+    fileId,
     id,
     selected,
+    selectable = true,
     chunkingStatus,
     onSelectedChange,
     knowledgeBaseId,
@@ -200,7 +215,11 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
     metadata,
     sourceType,
     slug,
+    userId,
+    visibility,
   }) => {
+    const { t } = useTranslation('components');
+    const chunkTargetId = getChunkTargetId({ fileId, id });
     const [markdownContent, setMarkdownContent] = useState<string>('');
     const [isLoadingMarkdown, setIsLoadingMarkdown] = useState(false);
 
@@ -212,15 +231,19 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
     // Memoize computed values that don't change
     const computedValues = useMemo(
       () => ({
-        isFolder: fileType === 'custom/folder',
+        isAudio: !!fileType?.startsWith('audio'),
+        isFolder: fileType === CUSTOM_FOLDER_FILE_TYPE,
         isImage: fileType && IMAGE_TYPES.has(fileType),
         isMarkdown: isMarkdownFile(name, fileType),
         isPage: isCustomPage(fileType, name),
+        isVideo: !!fileType?.startsWith('video'),
+        // web clippings: article documents plus raw html captures
+        isWebpage: fileType === 'article' || !!fileType?.startsWith('text/html'),
       }),
       [fileType, name],
     );
 
-    const { isImage, isMarkdown, isPage, isFolder } = computedValues;
+    const { isAudio, isImage, isMarkdown, isPage, isFolder, isVideo, isWebpage } = computedValues;
 
     // Use shared click handler hook
     const handleItemClick = useFileItemClick({
@@ -371,6 +394,8 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
       libraryId: knowledgeBaseId,
       sourceType,
       url,
+      userId,
+      visibility,
     });
 
     return (
@@ -396,13 +421,16 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
       >
         <div
           className={cx('checkbox', styles.checkbox)}
+          style={{ cursor: selectable ? 'pointer' : 'not-allowed' }}
+          title={selectable ? undefined : t('FileManager.selection.onlyOwn')}
           onPointerDown={stopPropagation}
           onClick={(e) => {
             e.stopPropagation();
+            if (!selectable) return;
             onSelectedChange(id, !selected);
           }}
         >
-          <Checkbox checked={selected} />
+          <Checkbox checked={selected} disabled={!selectable} />
         </div>
 
         <div
@@ -416,12 +444,27 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
         <div
           className={cx(
             styles.content,
-            !isImage && !isMarkdown && !isPage && styles.contentWithPadding,
+            !isImage &&
+              !isMarkdown &&
+              !isPage &&
+              !isVideo &&
+              !isAudio &&
+              !isWebpage &&
+              styles.contentWithPadding,
           )}
           onClick={handleItemClick}
         >
           {(() => {
             switch (true) {
+              case isWebpage: {
+                return <WebpageFileItem content={content} name={name} url={url} />;
+              }
+              case isVideo && !!url: {
+                return <VideoFileItem isInView={isInView} name={name} size={size} url={url} />;
+              }
+              case isAudio && !!url: {
+                return <AudioFileItem isInView={isInView} name={name} size={size} url={url} />;
+              }
               case isImage && !!url: {
                 return (
                   <ImageFileItem
@@ -432,8 +475,9 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
                     embeddingStatus={embeddingStatus ?? undefined}
                     fileType={fileType}
                     finishEmbedding={finishEmbedding}
-                    id={id}
+                    id={chunkTargetId}
                     isInView={isInView}
+                    metadata={metadata}
                     name={name}
                     size={size}
                     url={url}
@@ -450,7 +494,7 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
                     embeddingStatus={embeddingStatus ?? undefined}
                     fileType={fileType}
                     finishEmbedding={finishEmbedding}
-                    id={id}
+                    id={chunkTargetId}
                     isLoadingMarkdown={isLoadingMarkdown}
                     markdownContent={markdownContent}
                     metadata={metadata}
@@ -468,7 +512,7 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
                     embeddingStatus={embeddingStatus ?? undefined}
                     fileType={fileType}
                     finishEmbedding={finishEmbedding}
-                    id={id}
+                    id={chunkTargetId}
                     isLoadingMarkdown={isLoadingMarkdown}
                     markdownContent={markdownContent}
                     name={name}
@@ -486,7 +530,7 @@ const MasonryFileItem = memo<MasonryFileItemProps>(
                     embeddingStatus={embeddingStatus ?? undefined}
                     fileType={fileType}
                     finishEmbedding={finishEmbedding}
-                    id={id}
+                    id={chunkTargetId}
                     name={name}
                     size={size}
                   />

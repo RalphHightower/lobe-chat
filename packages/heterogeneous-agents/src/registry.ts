@@ -1,28 +1,77 @@
 /**
  * Agent Adapter Registry
  *
- * Maps agent type keys to their adapter constructors and CLI presets.
- * New agents are added by registering here — no other code changes needed.
+ * Maps agent type keys to their adapter constructors. New agents are added
+ * by registering here — no other code changes needed.
  */
 
-import { ClaudeCodeAdapter, claudeCodePreset, CodexAdapter, codexPreset } from './adapters';
-import type { AgentCLIPreset, AgentEventAdapter } from './types';
+import {
+  AmpAdapter,
+  ClaudeCodeAdapter,
+  ClaudeCodeSdkAdapter,
+  CodeBuddyAdapter,
+  CodexAdapter,
+  CursorAdapter,
+  GrokBuildAdapter,
+  KimiCodeAdapter,
+  OpenCodeAdapter,
+  PiAdapter,
+  QoderAdapter,
+  TraeAcpAdapter,
+} from './adapters';
+import type { LocalHeterogeneousAgentType } from './config';
+import type { AgentEventAdapter } from './types';
 
 interface AgentRegistryEntry {
   createAdapter: () => AgentEventAdapter;
-  preset: AgentCLIPreset;
 }
 
-const registry: Record<string, AgentRegistryEntry> = {
+const localAgentRegistry = {
+  'amp': {
+    createAdapter: () => new AmpAdapter(),
+  },
   'claude-code': {
     createAdapter: () => new ClaudeCodeAdapter(),
-    preset: claudeCodePreset,
+  },
+  'codebuddy': {
+    createAdapter: () => new CodeBuddyAdapter(),
   },
   'codex': {
     createAdapter: () => new CodexAdapter(),
-    preset: codexPreset,
   },
-  // 'kimi-cli': { createAdapter: () => new KimiCLIAdapter(), preset: kimiPreset },
+  'cursor': {
+    createAdapter: () => new CursorAdapter(),
+  },
+  'grok-build': {
+    createAdapter: () => new GrokBuildAdapter(),
+  },
+  'kimi-code': {
+    createAdapter: () => new KimiCodeAdapter(),
+  },
+  'opencode': {
+    createAdapter: () => new OpenCodeAdapter(),
+  },
+  'pi': {
+    createAdapter: () => new PiAdapter(),
+  },
+  'qoder': {
+    createAdapter: () => new QoderAdapter(),
+  },
+  'trae': {
+    createAdapter: () => new TraeAcpAdapter(),
+  },
+  // 'kimi-cli': { createAdapter: () => new KimiCLIAdapter() },
+} satisfies Record<LocalHeterogeneousAgentType, AgentRegistryEntry>;
+
+const runtimeAdapterRegistry = {
+  'claude-code-sdk': {
+    createAdapter: () => new ClaudeCodeSdkAdapter(),
+  },
+} satisfies Record<string, AgentRegistryEntry>;
+
+const registry: Record<string, AgentRegistryEntry> = {
+  ...localAgentRegistry,
+  ...runtimeAdapterRegistry,
 };
 
 /**
@@ -39,19 +88,10 @@ export const createAdapter = (agentType: string): AgentEventAdapter => {
 };
 
 /**
- * Get the CLI preset for the given agent type.
- */
-export const getPreset = (agentType: string): AgentCLIPreset => {
-  const entry = registry[agentType];
-  if (!entry) {
-    throw new Error(
-      `Unknown agent type: "${agentType}". Available: ${Object.keys(registry).join(', ')}`,
-    );
-  }
-  return entry.preset;
-};
-
-/**
  * List all registered agent types.
  */
 export const listAgentTypes = (): string[] => Object.keys(registry);
+
+/** Local CLI adapters that must match the shared descriptor catalog. */
+export const listLocalAgentTypes = (): LocalHeterogeneousAgentType[] =>
+  Object.keys(localAgentRegistry) as LocalHeterogeneousAgentType[];

@@ -1,14 +1,15 @@
 ---
 name: i18n
-description: Internationalization guide using react-i18next. Use when adding translations, creating i18n keys, or working with localized text in React components (.tsx files). Triggers on translation tasks, locale management, or i18n implementation.
+description: 'LobeHub i18n with react-i18next. Use for user-facing strings, locale keys, namespaces, useTranslation, t(), interpolation, zh-CN/en-US previews, hardcoded UI copy, or bun run i18n.'
+user-invocable: false
 ---
 
 # LobeHub Internationalization Guide
 
 - Default language: English (en-US)
 - Framework: react-i18next
-- **Only edit files in `src/locales/default/`** - Never edit JSON files in `locales/`
-- Run `pnpm i18n` to generate translations (or manually translate zh-CN/en-US for dev preview)
+- **Only edit files in `packages/locales/src/default/`** - Never edit JSON files in `locales/` (except hand-written en-US/zh-CN previews)
+- Leave generated locales to the daily `auto-i18n.yml` workflow by default; run `bun run i18n` manually only when they are needed immediately
 
 ## Key Naming Convention
 
@@ -50,10 +51,11 @@ export default {
 
 ## Workflow
 
-1. Add keys to `src/locales/default/{namespace}.ts`
-2. Export new namespace in `src/locales/default/index.ts`
+1. Add keys to `packages/locales/src/default/{namespace}.ts`
+2. Export new namespace in `packages/locales/src/default/index.ts`
 3. For dev preview: manually translate `locales/zh-CN/{namespace}.json` and `locales/en-US/{namespace}.json`
-4. Remind the user to run `pnpm i18n` before creating PR — do NOT run it yourself (very slow)
+4. Leave all other locales to `.github/workflows/auto-i18n.yml`, which runs daily and opens an automated translation PR
+5. Run `bun run i18n` manually only when the branch needs those translations immediately; it is slow and requires `OPENAI_API_KEY`
 
 ## Usage
 

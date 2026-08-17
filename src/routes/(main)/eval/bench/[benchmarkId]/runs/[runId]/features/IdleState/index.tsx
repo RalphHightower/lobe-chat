@@ -1,15 +1,15 @@
 'use client';
 
-import { Button, Icon } from '@lobehub/ui';
-import { App } from 'antd';
-import { createStaticStyles, cx } from 'antd-style';
+import { Icon } from '@lobehub/ui';
+import { Button, confirmModal, toast } from '@lobehub/ui/base-ui';
+import { createStaticStyles, cssVar, cx } from 'antd-style';
 import { Brain, ChartBar, MessageSquare, Play } from 'lucide-react';
 import { memo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useEvalStore } from '@/store/eval';
 
-const styles = createStaticStyles(({ css, cssVar }) => ({
+const styles = createStaticStyles(({ css }) => ({
   center: css`
     position: absolute;
     inset: 0;
@@ -21,7 +21,7 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     width: 40px;
     height: 40px;
     margin: auto;
-    border-radius: 50%;
+    border-radius: 999px;
 
     color: ${cssVar.colorTextSecondary};
 
@@ -39,7 +39,7 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
   `,
   hint: css`
     margin-block-start: 24px;
-    font-size: 13px;
+    font-size: ${cssVar.fontSize};
     color: ${cssVar.colorTextQuaternary};
   `,
   icon: css`
@@ -52,7 +52,7 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
 
     width: 30px;
     height: 30px;
-    border-radius: 8px;
+    border-radius: ${cssVar.borderRadius};
   `,
   icon1: css`
     inset-block-start: 15px;
@@ -78,7 +78,7 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
 
     margin: auto;
     border: 1px solid ${cssVar.colorBorderSecondary};
-    border-radius: 50%;
+    border-radius: 999px;
   `,
   orbit1: css`
     width: 200px;
@@ -105,12 +105,12 @@ interface IdleStateProps {
 
 const IdleState = memo<IdleStateProps>(({ run }) => {
   const { t } = useTranslation('eval');
-  const { modal, message } = App.useApp();
+
   const startRun = useEvalStore((s) => s.startRun);
   const [starting, setStarting] = useState(false);
 
   const handleStart = () => {
-    modal.confirm({
+    confirmModal({
       content: t('run.actions.start.confirm'),
       okText: t('run.actions.start'),
       onOk: async () => {
@@ -118,7 +118,7 @@ const IdleState = memo<IdleStateProps>(({ run }) => {
           setStarting(true);
           await startRun(run.id, run.status !== 'idle');
         } catch (error: any) {
-          message.error(error?.message || 'Failed to start run');
+          toast.error(error?.message || 'Failed to start run');
         } finally {
           setStarting(false);
         }

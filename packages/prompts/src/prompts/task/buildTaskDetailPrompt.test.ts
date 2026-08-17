@@ -24,7 +24,21 @@ describe('buildTaskDetailPrompt', () => {
     expect(result).not.toContain('<high_priority_instruction>');
   });
 
-  it('includes subtasks, dependencies, and review', () => {
+  it('includes default Lobe AI assignee hint when provided', () => {
+    const result = buildTaskDetailPrompt(
+      {
+        defaultAssigneeAgentId: 'agt_inbox',
+        task: baseTask,
+      },
+      NOW,
+    );
+
+    expect(result).toContain('<task_manager_defaults>');
+    expect(result).toContain('Default Lobe AI agent id: agt_inbox');
+    expect(result).toContain('Use this id as assigneeAgentId');
+  });
+
+  it('includes subtasks and dependencies', () => {
     const result = buildTaskDetailPrompt(
       {
         task: {
@@ -37,11 +51,6 @@ describe('buildTaskDetailPrompt', () => {
             { identifier: 'T-3-1', name: 'Draft', status: 'completed' },
             { identifier: 'T-3-2', name: 'Polish', status: 'backlog', blockedBy: 'T-3-1' },
           ],
-          review: {
-            enabled: true,
-            maxIterations: 3,
-            rubrics: [{ name: 'Clarity', type: 'llm', threshold: 0.8 }],
-          },
         },
       },
       NOW,
@@ -51,7 +60,6 @@ describe('buildTaskDetailPrompt', () => {
     expect(result).toContain('Parent: T-1');
     expect(result).toContain('Dependencies: completion: T-2');
     expect(result).toContain('Subtasks:');
-    expect(result).toContain('Review (maxIterations: 3)');
   });
 
   it('renders workspace tree and activities timeline', () => {

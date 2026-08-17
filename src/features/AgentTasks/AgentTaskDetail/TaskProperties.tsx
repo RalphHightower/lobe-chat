@@ -9,6 +9,7 @@ import { taskDetailSelectors } from '@/store/task/selectors';
 import TaskPriorityTag from '../features/TaskPriorityTag';
 import TaskStatusTag from '../features/TaskStatusTag';
 import TaskTriggerTag from '../features/TaskTriggerTag';
+import TaskAcceptanceStateRow from './TaskAcceptanceStateRow';
 import TaskScheduleConfig from './TaskScheduleConfig';
 
 interface StatusMeta {
@@ -22,6 +23,7 @@ const STATUS_META: Record<TaskStatus, StatusMeta> = {
   failed: { labelKey: 'status.failed' },
   paused: { labelKey: 'status.paused' },
   running: { labelKey: 'status.running' },
+  scheduled: { labelKey: 'status.scheduled' },
 };
 
 interface PriorityMeta {
@@ -43,6 +45,9 @@ const TaskProperties = memo(() => {
   const status = useTaskStore(taskDetailSelectors.activeTaskStatus) as TaskStatus | undefined;
   const priority = useTaskStore(taskDetailSelectors.activeTaskPriority);
   const heartbeatInterval = useTaskStore(taskDetailSelectors.activeTaskPeriodicInterval);
+  const automationMode = useTaskStore(taskDetailSelectors.activeTaskAutomationMode);
+  const schedulePattern = useTaskStore(taskDetailSelectors.activeTaskSchedulePattern);
+  const scheduleTimezone = useTaskStore(taskDetailSelectors.activeTaskScheduleTimezone);
 
   if (!taskId) return null;
 
@@ -65,6 +70,10 @@ const TaskProperties = memo(() => {
           <Text weight={500}>{t(`taskDetail.${statusMeta.labelKey}` as never)}</Text>
         </Block>
       </TaskStatusTag>
+
+      {/* The human layer: whether the delivery is accepted. Read-only here —
+          the decision itself is made on the acceptance page this links to. */}
+      <TaskAcceptanceStateRow />
 
       <TaskPriorityTag priority={priority} taskIdentifier={taskId}>
         <Block
@@ -91,7 +100,13 @@ const TaskProperties = memo(() => {
           paddingInline={8}
           variant={'borderless'}
         >
-          <TaskTriggerTag heartbeatInterval={heartbeatInterval} mode="inline" />
+          <TaskTriggerTag
+            automationMode={automationMode}
+            heartbeatInterval={heartbeatInterval}
+            mode="inline"
+            schedulePattern={schedulePattern}
+            scheduleTimezone={scheduleTimezone}
+          />
         </Block>
       </TaskScheduleConfig>
     </Block>

@@ -1,12 +1,18 @@
+lockfile: false
 packages:
   - packages/**
   - .
   - e2e
   - apps/desktop/src/main
+  - apps/server
+
+minimumReleaseAgeExclude:
+  - '@lobehub/ui@5.20.2'
 
 onlyBuiltDependencies:
-  - '@vercel/speed-insights'
+  - '@google/genai'
   - '@lobehub/editor'
+  - '@vercel/speed-insights'
 
 overrides:
   jose: ^6.1.3

@@ -1,140 +1,196 @@
 'use client';
 
+import {
+  closestCenter,
+  DndContext,
+  type DragEndEvent,
+  KeyboardSensor,
+  type Modifier,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core';
+import { horizontalListSortingStrategy, SortableContext } from '@dnd-kit/sortable';
 import { useWatchBroadcast } from '@lobechat/electron-client-ipc';
-import { ActionIcon, ScrollArea } from '@lobehub/ui';
+import { ActionIcon, Flexbox } from '@lobehub/ui';
+import { type DropdownItem, DropdownMenu } from '@lobehub/ui/base-ui';
 import { cx } from 'antd-style';
-import { Plus } from 'lucide-react';
-import { startTransition, useCallback, useEffect, useMemo, useRef } from 'react';
+import { ChevronDown, Plus } from 'lucide-react';
+import { useMotionValue, useSpring } from 'motion/react';
+import * as m from 'motion/react-m';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
 
-import { usePluginContext } from '@/features/Electron/titlebar/RecentlyViewed/hooks/usePluginContext';
-import { pluginRegistry } from '@/features/Electron/titlebar/RecentlyViewed/plugins';
+import { buildWorkspaceAwarePath } from '@/features/Workspace/workspaceAwarePath';
+import { useActiveLocation } from '@/hooks/useActiveLocation';
+import { useRegisterDesktopTabHotkeys } from '@/hooks/useHotkeys/desktopTabScope';
+import { usePermission } from '@/hooks/usePermission';
 import { electronSystemService } from '@/services/electron/system';
 import { useElectronStore } from '@/store/electron';
+import { useUserStore } from '@/store/user';
+import { labPreferSelectors } from '@/store/user/selectors';
 import { electronStylish } from '@/styles/electron';
 
 import { useResolvedTabs } from './hooks/useResolvedTabs';
+import { useStripWidth } from './hooks/useStripWidth';
+import { TAB_SPRING } from './motion';
+import { resolveTabScope } from './scope';
 import { useStyles } from './styles';
 import TabItem from './TabItem';
+import {
+  allocateTabWidths,
+  OVERFLOW_CONTROL_WIDTH,
+  PINNED_DIVIDER_WIDTH,
+  PINNED_TAB_WIDTH,
+  resolvePlacements,
+  resolveTabTier,
+  TAB_GAP,
+} from './tabLayout';
 
-const TAB_WIDTH = 180;
-const TAB_GAP = 2;
+const NEW_TAB_URL = '/';
+const NEW_TAB_BUTTON_WIDTH = 26 + TAB_GAP;
+
+// Tabs only reorder along the horizontal axis, so lock the drag transform to X.
+const restrictToHorizontalAxis: Modifier = ({ transform }) => ({ ...transform, y: 0 });
 
 const TabBar = () => {
   const styles = useStyles;
-  const navigate = useNavigate();
+  const location = useActiveLocation();
+  useRegisterDesktopTabHotkeys();
   const { t } = useTranslation('electron');
-  const viewportRef = useRef<HTMLDivElement>(null);
+  const { allowed: canCreate, reason } = usePermission('create_content');
+  const [stripWidth, stripRef] = useStripWidth();
   const { tabs, activeTabId } = useResolvedTabs();
-  const pluginCtx = usePluginContext();
-  const activateTab = useElectronStore((s) => s.activateTab);
-  const addTab = useElectronStore((s) => s.addTab);
+  const splitView = useElectronStore((s) => s.splitView);
+  const splitViewEnabled = useUserStore(labPreferSelectors.enableDesktopSplitView);
+  const switchTab = useElectronStore((s) => s.switchTab);
+  const addNewTab = useElectronStore((s) => s.addNewTab);
   const removeTab = useElectronStore((s) => s.removeTab);
   const closeOtherTabs = useElectronStore((s) => s.closeOtherTabs);
   const closeLeftTabs = useElectronStore((s) => s.closeLeftTabs);
   const closeRightTabs = useElectronStore((s) => s.closeRightTabs);
+  const reorderTabs = useElectronStore((s) => s.reorderTabs);
+  const pinTab = useElectronStore((s) => s.pinTab);
+  const unpinTab = useElectronStore((s) => s.unpinTab);
+  const closeSplitView = useElectronStore((s) => s.closeSplitView);
+  const openTabInSplitView = useElectronStore((s) => s.openTabInSplitView);
 
-  const handleActivate = useCallback(
-    (id: string, url: string) => {
-      // Prioritize updating the Tab activation state (high priority)
-      activateTab(id);
-      const tab = tabs.find((t) => t.reference.id === id);
-      if (tab) pluginRegistry.onActivate(tab.reference);
-      // Degrade route navigation to startTransition (low priority)
-      startTransition(() => navigate(url));
-    },
-    [activateTab, navigate, tabs],
+  const sensors = useSensors(
+    // Require a small drag distance so a plain click still activates the tab.
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor),
   );
 
-  const navigateToActive = useCallback(() => {
-    const { activeTabId: newActiveId, tabs: newTabs } = useElectronStore.getState();
-    if (newActiveId) {
-      const target = newTabs.find((t) => t.id === newActiveId);
-      if (target) {
-        const resolved = tabs.find((t) => t.reference.id === newActiveId);
-        if (resolved) navigate(resolved.url);
-      }
-    } else {
-      navigate('/');
-    }
-  }, [tabs, navigate]);
+  const tabIds = useMemo(() => tabs.map((tab) => tab.tab.id), [tabs]);
+  const pinnedTabs = useMemo(() => tabs.filter((tab) => tab.tab.pinned), [tabs]);
+  const flowTabs = useMemo(() => tabs.filter((tab) => !tab.tab.pinned), [tabs]);
+
+  const layout = useMemo(() => {
+    const pinnedWidth = pinnedTabs.length
+      ? pinnedTabs.length * (PINNED_TAB_WIDTH + TAB_GAP) + PINNED_DIVIDER_WIDTH
+      : 0;
+
+    return allocateTabWidths({
+      activeIndex: flowTabs.findIndex((tab) => tab.tab.id === activeTabId),
+      count: flowTabs.length,
+      usableWidth: Math.max(0, stripWidth - pinnedWidth - NEW_TAB_BUTTON_WIDTH),
+    });
+  }, [flowTabs, pinnedTabs.length, activeTabId, stripWidth]);
+
+  const { dividerX, placements, total } = useMemo(
+    () =>
+      resolvePlacements({
+        flowIds: flowTabs.map((tab) => tab.tab.id),
+        pinnedIds: pinnedTabs.map((tab) => tab.tab.id),
+        visibleIndices: layout.visibleIndices,
+        widths: layout.widths,
+      }),
+    [flowTabs, pinnedTabs, layout],
+  );
+
+  const tabsById = useMemo(() => new Map(tabs.map((tab) => [tab.tab.id, tab])), [tabs]);
+
+  const targetTotal = useMotionValue(0);
+  const springTotal = useSpring(targetTotal, TAB_SPRING);
+  const targetDividerX = useMotionValue(dividerX);
+  const springDividerX = useSpring(targetDividerX, TAB_SPRING);
+
+  // Read during render, so it still holds the width the strip had on the previous commit
+  // — which is exactly where a tab appended this commit should enter from.
+  const previousTotal = useRef(0);
+
+  useEffect(() => {
+    targetTotal.set(total);
+    targetDividerX.set(dividerX);
+    previousTotal.current = total;
+  }, [total, dividerX, targetTotal, targetDividerX]);
+
+  const newTabUrl = useMemo(() => {
+    const scope = resolveTabScope(location.pathname + location.search);
+    const activeSlug = scope.type === 'workspace' ? scope.slug : null;
+
+    return buildWorkspaceAwarePath(NEW_TAB_URL, activeSlug);
+  }, [location.pathname, location.search]);
+
+  const handleDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!over || active.id === over.id) return;
+
+      const fromIndex = tabIds.indexOf(active.id as string);
+      const toIndex = tabIds.indexOf(over.id as string);
+      if (fromIndex < 0 || toIndex < 0) return;
+
+      reorderTabs(fromIndex, toIndex);
+    },
+    [tabIds, reorderTabs],
+  );
+
+  const handleActivate = useCallback(
+    (id: string) => {
+      switchTab(id);
+    },
+    [switchTab],
+  );
 
   const handleClose = useCallback(
     (id: string) => {
-      const isActive = id === activeTabId;
-      const nextActiveId = removeTab(id);
-
-      startTransition(() => {
-        if (isActive && nextActiveId) {
-          const nextTab = tabs.find((t) => t.reference.id === nextActiveId);
-          if (nextTab) {
-            navigate(nextTab.url);
-          }
-        }
-
-        if (!nextActiveId) {
-          navigate('/');
-        }
-      });
+      removeTab(id);
     },
-    [activeTabId, removeTab, tabs, navigate],
+    [removeTab],
   );
 
   const handleCloseOthers = useCallback(
     (id: string) => {
       closeOtherTabs(id);
-      startTransition(() => {
-        const target = tabs.find((t) => t.reference.id === id);
-        if (target) navigate(target.url);
-      });
     },
-    [closeOtherTabs, tabs, navigate],
+    [closeOtherTabs],
   );
 
   const handleCloseLeft = useCallback(
     (id: string) => {
       closeLeftTabs(id);
-      startTransition(() => navigateToActive());
     },
-    [closeLeftTabs, navigateToActive],
+    [closeLeftTabs],
   );
 
   const handleCloseRight = useCallback(
     (id: string) => {
       closeRightTabs(id);
-      startTransition(() => navigateToActive());
     },
-    [closeRightTabs, navigateToActive],
+    [closeRightTabs],
   );
 
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport || !activeTabId) return;
+  const handleTogglePin = useCallback(
+    (id: string) => {
+      const target = tabs.find((tab) => tab.tab.id === id);
+      if (!target) return;
 
-    const activeIndex = tabs.findIndex((t) => t.reference.id === activeTabId);
-    if (activeIndex < 0) return;
-
-    const tabLeft = activeIndex * (TAB_WIDTH + TAB_GAP);
-    const tabRight = tabLeft + TAB_WIDTH;
-    const { scrollLeft, clientWidth } = viewport;
-
-    if (tabLeft < scrollLeft) {
-      viewport.scrollLeft = tabLeft;
-    } else if (tabRight > scrollLeft + clientWidth) {
-      viewport.scrollLeft = tabRight - clientWidth;
-    }
-  }, [activeTabId, tabs]);
-
-  const activeReference = useMemo(() => {
-    if (!activeTabId) return null;
-    return tabs.find((t) => t.reference.id === activeTabId)?.reference ?? null;
-  }, [activeTabId, tabs]);
-
-  const newTabAction = useMemo(() => {
-    if (!activeReference) return null;
-    return pluginRegistry.getNewTabAction(activeReference, pluginCtx);
-  }, [activeReference, pluginCtx]);
+      if (target.tab.pinned) unpinTab(id);
+      else pinTab(id);
+    },
+    [tabs, pinTab, unpinTab],
+  );
 
   useWatchBroadcast('closeCurrentTabOrWindow', () => {
     if (tabs.length > 1 && activeTabId) {
@@ -144,64 +200,109 @@ const TabBar = () => {
     }
   });
 
-  const handleNewTab = useCallback(async () => {
-    if (!newTabAction) return;
-    let result;
-    try {
-      result = await newTabAction.onCreate();
-    } catch (error) {
-      console.error('[TabBar] failed to create new tab:', error);
-      return;
-    }
-    if (!result) return;
+  const handleNewTab = useCallback(() => {
+    if (!canCreate) return;
 
-    const { reference, cached } = result;
-    addTab(reference, cached, true);
-    pluginRegistry.onActivate(reference);
-
-    const resolved = pluginRegistry.resolve(reference, pluginCtx);
-    const url = resolved?.url;
-    if (url) startTransition(() => navigate(url));
-  }, [newTabAction, addTab, pluginCtx, navigate]);
+    // Always open a fresh Home tab, even if a Home tab already exists.
+    addNewTab(newTabUrl);
+  }, [canCreate, addNewTab, newTabUrl]);
 
   useWatchBroadcast('createNewTab', () => {
-    void handleNewTab();
+    handleNewTab();
   });
+
+  const overflowItems = useCallback((): DropdownItem[] => {
+    const visible = new Set(layout.visibleIndices);
+
+    return flowTabs
+      .map((tab, index) => ({ index, tab }))
+      .filter(({ index }) => !visible.has(index))
+      .map(({ tab }) => ({
+        key: tab.tab.id,
+        label: tab.meta.title,
+        onClick: () => handleActivate(tab.tab.id),
+      }));
+  }, [flowTabs, layout.visibleIndices, handleActivate]);
 
   if (tabs.length === 0) return null;
 
   return (
-    <ScrollArea
-      className={styles.container}
-      viewportProps={{ ref: viewportRef }}
-      contentProps={{
-        style: { alignItems: 'center', flexDirection: 'row', gap: TAB_GAP },
-      }}
-    >
-      {tabs.map((tab, index) => (
-        <TabItem
-          index={index}
-          isActive={tab.reference.id === activeTabId}
-          item={tab}
-          key={tab.reference.id}
-          totalCount={tabs.length}
-          onActivate={handleActivate}
-          onClose={handleClose}
-          onCloseLeft={handleCloseLeft}
-          onCloseOthers={handleCloseOthers}
-          onCloseRight={handleCloseRight}
-        />
-      ))}
-      {newTabAction && (
-        <ActionIcon
-          className={cx(electronStylish.nodrag, styles.newTabButton)}
-          icon={Plus}
-          size="small"
-          title={t('tab.newTab')}
-          onClick={handleNewTab}
-        />
+    <Flexbox horizontal align={'center'} className={styles.container} gap={TAB_GAP} ref={stripRef}>
+      <DndContext
+        collisionDetection={closestCenter}
+        modifiers={[restrictToHorizontalAxis]}
+        sensors={sensors}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext items={tabIds} strategy={horizontalListSortingStrategy}>
+          {/* One keyed list for pinned and flowing tabs alike. Rendering them as two
+              sibling arrays scoped their keys separately, so pinning unmounted the tab
+              from one and mounted a fresh one in the other — losing its springs, which
+              is why the tab used to pop rather than travel. */}
+          <m.div className={styles.strip} style={{ width: springTotal }}>
+            {placements.map((placement) => {
+              const tab = tabsById.get(placement.id);
+              if (!tab) return null;
+
+              return (
+                <TabItem
+                  enterX={previousTotal.current}
+                  index={tabIds.indexOf(placement.id)}
+                  isActive={placement.id === activeTabId}
+                  item={tab}
+                  key={placement.id}
+                  pinnedCount={pinnedTabs.length}
+                  splitViewEnabled={splitViewEnabled}
+                  tier={resolveTabTier(placement.width)}
+                  totalCount={tabs.length}
+                  width={placement.width}
+                  x={placement.x}
+                  isSplitVisible={
+                    splitView?.primaryTabId === placement.id ||
+                    splitView?.secondaryTabId === placement.id
+                  }
+                  onActivate={handleActivate}
+                  onClose={handleClose}
+                  onCloseLeft={handleCloseLeft}
+                  onCloseOthers={handleCloseOthers}
+                  onCloseRight={handleCloseRight}
+                  onCloseSplitView={closeSplitView}
+                  onOpenInSplitView={openTabInSplitView}
+                  onTogglePin={handleTogglePin}
+                />
+              );
+            })}
+            <m.span
+              className={styles.pinnedDivider}
+              style={{ opacity: pinnedTabs.length > 0 ? 1 : 0, x: springDividerX }}
+            />
+          </m.div>
+        </SortableContext>
+      </DndContext>
+      <ActionIcon
+        className={cx(electronStylish.nodrag, styles.newTabButton)}
+        disabled={!canCreate}
+        icon={Plus}
+        size="small"
+        title={canCreate ? t('tab.newTab') : reason}
+        onClick={canCreate ? handleNewTab : undefined}
+      />
+      {layout.hiddenCount > 0 && (
+        <DropdownMenu items={overflowItems} placement={'bottomRight'}>
+          <Flexbox
+            horizontal
+            align={'center'}
+            className={cx(electronStylish.nodrag, styles.overflowButton)}
+            gap={2}
+            style={{ width: OVERFLOW_CONTROL_WIDTH }}
+            title={t('tab.overflow', { count: layout.hiddenCount })}
+          >
+            <ChevronDown size={12} />
+            {layout.hiddenCount}
+          </Flexbox>
+        </DropdownMenu>
       )}
-    </ScrollArea>
+    </Flexbox>
   );
 };
 

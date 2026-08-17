@@ -11,12 +11,6 @@ interface TestAgentState {
 }
 
 interface TestAiState {
-  extendParamOptions?: {
-    enableReasoning?: {
-      defaultValue?: boolean;
-      includeBudget?: boolean;
-    };
-  };
   extendParams: string[];
 }
 
@@ -27,7 +21,6 @@ const testState = vi.hoisted(() => ({
     provider: 'openai',
   } as TestAgentState,
   aiState: {
-    extendParamOptions: undefined,
     extendParams: ['enableReasoning'],
   } as TestAiState,
   setFieldsValue: vi.fn(),
@@ -38,7 +31,10 @@ vi.mock('@lobehub/ui', () => {
   const MockForm = () => <div data-testid="controls-form" />;
   MockForm.useForm = () => [{ setFieldsValue: testState.setFieldsValue }];
 
-  return { Form: MockForm };
+  return {
+    Flexbox: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
+    Form: MockForm,
+  };
 });
 
 vi.mock('antd', () => {
@@ -80,7 +76,6 @@ vi.mock('@/store/agent/selectors', () => ({
 
 vi.mock('@/store/aiInfra', () => ({
   aiModelSelectors: {
-    modelExtendParamOptions: () => (state: TestAiState) => state.extendParamOptions,
     modelExtendParams: () => (state: TestAiState) => state.extendParams,
   },
   useAiInfraStore: <T,>(selector: (state: TestAiState) => T) => selector(testState.aiState),
@@ -95,30 +90,63 @@ describe('ControlsForm', () => {
       provider: 'openai',
     };
     testState.aiState = {
-      extendParamOptions: undefined,
       extendParams: ['enableReasoning'],
     };
   });
 
-  it('should sync model default values into mounted form without persisting them', () => {
-    const { rerender } = render(<ControlsForm model="gpt-4" provider="openai" />);
-
-    expect(testState.setFieldsValue).toHaveBeenLastCalledWith({ enableReasoning: undefined });
-    expect(testState.updateAgentChatConfig).not.toHaveBeenCalled();
-
-    testState.aiState = {
-      extendParamOptions: {
-        enableReasoning: {
-          defaultValue: true,
-          includeBudget: false,
-        },
-      },
-      extendParams: ['enableReasoning'],
+  it('should sync legacy thinking values into mounted form without persisting them', () => {
+    testState.agentState.config = {
+      thinking: 'disabled',
     };
 
-    rerender(<ControlsForm model="deepseek-v4-flash" provider="deepseek" />);
+    const { unmount } = render(<ControlsForm model="gpt-4" provider="openai" />);
 
-    expect(testState.setFieldsValue).toHaveBeenLastCalledWith({ enableReasoning: true });
+    expect(testState.setFieldsValue).toHaveBeenLastCalledWith({
+      enableReasoning: false,
+      thinking: 'disabled',
+    });
     expect(testState.updateAgentChatConfig).not.toHaveBeenCalled();
+
+    unmount();
+
+    testState.agentState.config = {
+      thinking: 'enabled',
+    };
+
+    render(<ControlsForm model="gpt-4" provider="openai" />);
+
+    expect(testState.setFieldsValue).toHaveBeenLastCalledWith({
+      enableReasoning: true,
+      thinking: 'enabled',
+    });
+    expect(testState.updateAgentChatConfig).not.toHaveBeenCalled();
+  });
+
+  it('should show model adaptive thinking default without persisting it', () => {
+    testState.aiState.extendParams = ['enableAdaptiveThinking'];
+
+    render(<ControlsForm model="claude-sonnet-5" provider="lobehub" />);
+
+    expect(testState.setFieldsValue).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        enableAdaptiveThinking: true,
+      }),
+    );
+    expect(testState.updateAgentChatConfig).not.toHaveBeenCalled();
+  });
+
+  it('should preserve explicit adaptive thinking override', () => {
+    testState.agentState.config = {
+      enableAdaptiveThinking: false,
+    };
+    testState.aiState.extendParams = ['enableAdaptiveThinking'];
+
+    render(<ControlsForm model="claude-sonnet-5" provider="lobehub" />);
+
+    expect(testState.setFieldsValue).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        enableAdaptiveThinking: false,
+      }),
+    );
   });
 });

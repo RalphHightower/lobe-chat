@@ -60,40 +60,6 @@ export const TOOL_HEADLINE_DETAIL_TRUNCATE_LEN = 117;
 /** Suffix when truncating tool strings. */
 export const TOOL_HEADLINE_TRUNCATION_SUFFIX = '...';
 
-// ─── Post-tool “final answer” block promotion (Group partition) ───────────
-
-/** Sum of heuristic scores at or above this promotes visible prose out of workflow chrome. */
-export const POST_TOOL_FINAL_ANSWER_SCORE_THRESHOLD = 3;
-
-/** Add this score when compacted prose length ≥ this (long answer signal). */
-export const POST_TOOL_ANSWER_LENGTH_LONG_SCORE = 2;
-
-/** Lower bound (chars) for POST_TOOL_ANSWER_LENGTH_LONG_SCORE. */
-export const POST_TOOL_ANSWER_LENGTH_LONG_MIN_CHARS = 180;
-
-/** Add this score when length ∈ [medium min, long min). */
-export const POST_TOOL_ANSWER_MEDIUM_TEXT_SCORE = 1;
-
-/** Lower bound (chars) for medium-length contribution. */
-export const POST_TOOL_ANSWER_LENGTH_MEDIUM_MIN_CHARS = 100;
-
-/** Blank-line paragraphing: strong signal for structured deliverable. */
-export const POST_TOOL_ANSWER_DOUBLE_NEWLINE_SCORE = 2;
-
-/** Without \\n\\n, treat many non-empty lines as paragraphing when count ≥ this. */
-export const POST_TOOL_ANSWER_MULTI_LINE_SCORE = 2;
-
-/** Minimum trimmed lines (with at least one non-empty) to count as multi-line body. */
-export const POST_TOOL_ANSWER_MULTI_LINE_MIN_COUNT = 3;
-
-/** Markdown heading or list at line start: structured deliverable. */
-export const POST_TOOL_ANSWER_MARKDOWN_STRUCTURE_SCORE = 2;
-
-/** Add one point when sentence-ending punctuation count ≥ this (compact text). */
-export const POST_TOOL_ANSWER_PUNCT_MIN_COUNT = 3;
-
-export const POST_TOOL_ANSWER_PUNCT_SCORE = 1;
-
 // ─── Time formatting (workflow summary / reasoning suffix) ───────────────
 
 /** Seconds per minute when formatting durations like "2m 30s". */
@@ -123,13 +89,11 @@ export const TOOL_API_DISPLAY_NAMES: Record<string, string> = {
 
   // Agent documents
   copyDocument: 'workflow.toolDisplayName.copyDocument',
-  editDocument: 'workflow.toolDisplayName.editDocument',
   listDocuments: 'workflow.toolDisplayName.listDocuments',
   readDocument: 'workflow.toolDisplayName.readDocument',
-  readDocumentByFilename: 'workflow.toolDisplayName.readDocumentByFilename',
   removeDocument: 'workflow.toolDisplayName.removeDocument',
   renameDocument: 'workflow.toolDisplayName.renameDocument',
-  upsertDocumentByFilename: 'workflow.toolDisplayName.upsertDocumentByFilename',
+  replaceDocumentContent: 'workflow.toolDisplayName.replaceDocumentContent',
   updateLoadRule: 'workflow.toolDisplayName.updateLoadRule',
 
   // Calculator
@@ -138,31 +102,49 @@ export const TOOL_API_DISPLAY_NAMES: Record<string, string> = {
   solve: 'workflow.toolDisplayName.solve',
   execute: 'workflow.toolDisplayName.execute',
 
-  // Local system
-  editLocalFile: 'workflow.toolDisplayName.editLocalFile',
-  globLocalFiles: 'workflow.toolDisplayName.globLocalFiles',
+  // Local system / cloud sandbox (file ops share the same display label)
+  editFile: 'workflow.toolDisplayName.editLocalFile',
+  globFiles: 'workflow.toolDisplayName.globLocalFiles',
   grepContent: 'workflow.toolDisplayName.grepContent',
   killCommand: 'workflow.toolDisplayName.killCommand',
+  listFiles: 'workflow.toolDisplayName.listLocalFiles',
+  moveFiles: 'workflow.toolDisplayName.moveLocalFiles',
+  readFile: 'workflow.toolDisplayName.readLocalFile',
+  runCommand: 'workflow.toolDisplayName.runCommand',
+  searchFiles: 'workflow.toolDisplayName.searchLocalFiles',
+  writeFile: 'workflow.toolDisplayName.writeLocalFile',
+  getCommandOutput: 'workflow.toolDisplayName.getCommandOutput',
+  // Legacy aliases — keep so historical messages still get a label.
+  // `renameLocalFile` is kept even though the new surface drops rename
+  // (rename is now done via `moveFiles`).
+  editLocalFile: 'workflow.toolDisplayName.editLocalFile',
+  globLocalFiles: 'workflow.toolDisplayName.globLocalFiles',
   listLocalFiles: 'workflow.toolDisplayName.listLocalFiles',
   moveLocalFiles: 'workflow.toolDisplayName.moveLocalFiles',
   readLocalFile: 'workflow.toolDisplayName.readLocalFile',
   renameLocalFile: 'workflow.toolDisplayName.renameLocalFile',
-  runCommand: 'workflow.toolDisplayName.runCommand',
   searchLocalFiles: 'workflow.toolDisplayName.searchLocalFiles',
   writeLocalFile: 'workflow.toolDisplayName.writeLocalFile',
-  getCommandOutput: 'workflow.toolDisplayName.getCommandOutput',
 
   // Cloud sandbox
   executeCode: 'workflow.toolDisplayName.executeCode',
 
-  // GTD
+  // Codex
+  command_execution: 'workflow.toolDisplayName.runCommand',
+  file_change: 'workflow.toolDisplayName.editLocalFile',
+  mcp_tool_call: 'workflow.toolDisplayName.callMcpTool',
+  todo_list: 'workflow.toolDisplayName.updateTodos',
+  web_search: 'workflow.toolDisplayName.search',
+
+  // Lobe Agent — Plan & Todos
   createPlan: 'workflow.toolDisplayName.createPlan',
   createTodos: 'workflow.toolDisplayName.createTodos',
   updatePlan: 'workflow.toolDisplayName.updatePlan',
   updateTodos: 'workflow.toolDisplayName.updateTodos',
   clearTodos: 'workflow.toolDisplayName.clearTodos',
-  execTask: 'workflow.toolDisplayName.execTask',
-  execTasks: 'workflow.toolDisplayName.execTasks',
+
+  // Lobe Agent — Sub-Agents
+  callSubAgent: 'workflow.toolDisplayName.callSubAgent',
 
   // Memory
   addActivityMemory: 'workflow.toolDisplayName.addActivityMemory',
@@ -200,8 +182,15 @@ export const TOOL_API_DISPLAY_NAMES: Record<string, string> = {
 
   // Misc
   finishOnboarding: 'workflow.toolDisplayName.finishOnboarding',
-  getOnboardingState: 'workflow.toolDisplayName.getOnboardingState',
   getTopicContext: 'workflow.toolDisplayName.getTopicContext',
   listOnlineDevices: 'workflow.toolDisplayName.listOnlineDevices',
   activateDevice: 'workflow.toolDisplayName.activateDevice',
+
+  // Web onboarding
+  saveUserQuestion: 'workflow.toolDisplayName.saveUserQuestion',
+  writeDocument: 'workflow.toolDisplayName.writeDocument',
+
+  // Agent marketplace
+  showAgentMarketplace: 'workflow.toolDisplayName.showAgentMarketplace',
+  submitAgentPick: 'workflow.toolDisplayName.submitAgentPick',
 };

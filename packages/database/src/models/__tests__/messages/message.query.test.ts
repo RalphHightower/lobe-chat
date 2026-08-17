@@ -1,6 +1,6 @@
 import { INBOX_SESSION_ID } from '@lobechat/const';
 import { eq } from 'drizzle-orm';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { uuid } from '@/utils/uuid';
 
@@ -94,6 +94,35 @@ describe('MessageModel Query Tests', () => {
       expect(result).toHaveLength(2);
       expect(result[0].id).toBe('1');
       expect(result[1].id).toBe('2');
+    });
+
+    it('reads usage from the dedicated column and falls back to metadata.usage', async () => {
+      await serverDB.insert(messages).values([
+        // dedicated column must win over the legacy metadata.usage
+        {
+          id: 'usage-col',
+          userId,
+          role: 'assistant',
+          content: 'a',
+          createdAt: new Date('2023-01-01'),
+          usage: { totalTokens: 100 } as any,
+          metadata: { usage: { totalTokens: 999 } },
+        },
+        // legacy row: only metadata.usage → falls back
+        {
+          id: 'usage-meta',
+          userId,
+          role: 'assistant',
+          content: 'b',
+          createdAt: new Date('2023-01-02'),
+          metadata: { usage: { totalTokens: 50 } },
+        },
+      ]);
+
+      const result = await messageModel.query();
+
+      expect(result.find((m) => m.id === 'usage-col')?.usage).toEqual({ totalTokens: 100 });
+      expect(result.find((m) => m.id === 'usage-meta')?.usage).toEqual({ totalTokens: 50 });
     });
 
     it('should return empty messages if not match the user ID', async () => {
@@ -290,22 +319,131 @@ describe('MessageModel Query Tests', () => {
       });
 
       const domain = 'http://abc.com';
-      // Call query method
-      const result = await messageModel.query(
-        {},
-        { postProcessUrl: async (path) => `${domain}/${path}` },
+      const postProcessUrl = vi.fn(
+        async (path: string | null, file: { id?: string | null }) => `${domain}/${file.id}/${path}`,
       );
+      // Call query method
+      const result = await messageModel.query({}, { postProcessUrl });
 
       // Assert result
       expect(result).toHaveLength(2);
       expect(result[0].id).toBe('1');
       expect(result[0].imageList).toEqual([
-        { alt: 'file-1', id: 'f-0', url: `${domain}/abc` },
-        { alt: 'file-3', id: 'f-3', url: `${domain}/abc` },
+        { alt: 'file-1', id: 'f-0', url: `${domain}/f-0/abc` },
+        { alt: 'file-3', id: 'f-3', url: `${domain}/f-3/abc` },
       ]);
+      expect(postProcessUrl).toHaveBeenCalledWith(
+        'abc',
+        expect.objectContaining({ fileType: 'image/png', id: 'f-0' }),
+      );
+      expect(postProcessUrl).toHaveBeenCalledWith(
+        'abc',
+        expect.objectContaining({ fileType: 'image/png', id: 'f-3' }),
+      );
 
       expect(result[1].id).toBe('2');
       expect(result[1].imageList).toEqual([]);
+    });
+
+    it('should pass file id to postProcessUrl when querying messages by ids', async () => {
+      await serverDB.transaction(async (trx) => {
+        await trx.insert(messages).values({
+          id: 'query-by-id-message',
+          userId,
+          role: 'user',
+          content: 'message with file',
+          createdAt: new Date('2023-01-01'),
+        });
+        await trx.insert(files).values({
+          id: 'query-by-id-file',
+          url: 'files/query-by-id.png',
+          name: 'query-by-id.png',
+          userId,
+          fileType: 'image/png',
+          size: 1000,
+        });
+        await trx.insert(messagesFiles).values({
+          fileId: 'query-by-id-file',
+          messageId: 'query-by-id-message',
+          userId,
+        });
+      });
+
+      const postProcessUrl = vi.fn(
+        async (path: string | null, file: { id?: string | null }) => `/f/${file.id}/${path}`,
+      );
+
+      const result = await messageModel.queryByIds(['query-by-id-message'], { postProcessUrl });
+
+      expect(result[0].imageList).toEqual([
+        {
+          alt: 'query-by-id.png',
+          id: 'query-by-id-file',
+          url: '/f/query-by-id-file/files/query-by-id.png',
+        },
+      ]);
+      expect(postProcessUrl).toHaveBeenCalledWith(
+        'files/query-by-id.png',
+        expect.objectContaining({ fileType: 'image/png', id: 'query-by-id-file' }),
+      );
+    });
+
+    it('materializes safe audio metadata and only validated duration in both query paths', async () => {
+      await serverDB.transaction(async (trx) => {
+        await trx.insert(messages).values({
+          content: 'message with audio',
+          createdAt: new Date('2023-01-01'),
+          id: 'audio-duration-message',
+          role: 'user',
+          userId,
+        });
+        await trx.insert(files).values([
+          {
+            fileType: 'audio/mpeg',
+            id: 'audio-duration-valid',
+            metadata: { durationMs: 2500, transcript: 'must-not-leak' },
+            name: 'valid.mp3',
+            size: 1000,
+            url: 'files/valid.mp3',
+            userId,
+          },
+          {
+            fileType: 'audio/mpeg',
+            id: 'audio-duration-invalid',
+            metadata: { durationMs: -1, recording: 'must-not-leak' },
+            name: 'invalid.mp3',
+            size: 1000,
+            url: 'files/invalid.mp3',
+            userId,
+          },
+        ]);
+        await trx.insert(messagesFiles).values([
+          { fileId: 'audio-duration-valid', messageId: 'audio-duration-message', userId },
+          { fileId: 'audio-duration-invalid', messageId: 'audio-duration-message', userId },
+        ]);
+      });
+
+      const queried = (await messageModel.query()).find(
+        (message) => message.id === 'audio-duration-message',
+      );
+      const queriedById = (await messageModel.queryByIds(['audio-duration-message']))[0];
+
+      for (const message of [queried, queriedById]) {
+        expect(message?.audioList).toHaveLength(2);
+        expect(message?.audioList?.find((audio) => audio.id === 'audio-duration-valid')).toEqual({
+          alt: 'valid.mp3',
+          durationMs: 2500,
+          id: 'audio-duration-valid',
+          mimeType: 'audio/mpeg',
+          url: 'files/valid.mp3',
+        });
+        expect(message?.audioList?.find((audio) => audio.id === 'audio-duration-invalid')).toEqual({
+          alt: 'invalid.mp3',
+          id: 'audio-duration-invalid',
+          mimeType: 'audio/mpeg',
+          url: 'files/invalid.mp3',
+        });
+      }
     });
 
     it('should include translate, tts and other extra fields in query result', async () => {
@@ -357,6 +495,96 @@ describe('MessageModel Query Tests', () => {
 
       const result3 = await messageModel.query({ current: 2, pageSize: 2 });
       expect(result3).toHaveLength(0);
+    });
+
+    describe('newest-first pagination ', () => {
+      // A topic whose mainline exceeds pageSize must keep its LATEST turns
+      // (including the final answer) rather than the oldest, and the returned
+      // slice must be a single contiguous parentId chain so the renderer — which
+      // roots a slice at one parent — drops nothing.
+      const seedRounds = async (topicId: string, rounds: number, stepsPerRound: number) => {
+        await serverDB.insert(topics).values([{ id: topicId, userId }]);
+        const rows: any[] = [];
+        let seq = 0;
+        let prevId: string | null = null;
+        for (let r = 1; r <= rounds; r += 1) {
+          const uid = `${topicId}-u${r}`;
+          rows.push({
+            id: uid,
+            userId,
+            topicId,
+            role: 'user',
+            parentId: prevId,
+            content: `q${r}`,
+            createdAt: new Date(2023, 0, 1, 0, seq),
+          });
+          seq += 1;
+          prevId = uid;
+          for (let step = 1; step <= stepsPerRound; step += 1) {
+            const sid = `${topicId}-a${r}-${step}`;
+            rows.push({
+              id: sid,
+              userId,
+              topicId,
+              role: 'assistant',
+              parentId: prevId,
+              content: `a${r}.${step}`,
+              createdAt: new Date(2023, 0, 1, 0, seq),
+            });
+            seq += 1;
+            prevId = sid;
+          }
+        }
+        await serverDB.insert(messages).values(rows);
+        return { lastId: prevId as string };
+      };
+
+      // Every message except the single root must have its parent inside the slice.
+      const isContiguousChain = (result: { id: string; parentId?: string | null }[]) => {
+        const ids = new Set(result.map((m) => m.id));
+        return result.every((m, i) => i === 0 || (!!m.parentId && ids.has(m.parentId)));
+      };
+
+      it('keeps the newest turns (final answer) instead of the oldest when truncated', async () => {
+        const topicId = 't-lobe12011-newest';
+        // 5 rounds x (1 user + 2 assistant) = 15 mainline messages; page size 4.
+        const { lastId } = await seedRounds(topicId, 5, 2);
+
+        const result = await messageModel.query({ topicId, current: 0, pageSize: 4 });
+
+        // The final answer (newest message) must be present — pre-fix `asc + limit`
+        // returned the OLDEST 4 and dropped it entirely.
+        expect(result.map((m) => m.id)).toContain(lastId);
+        expect(result.at(-1)!.id).toBe(lastId);
+      });
+
+      it('aligns the lower boundary to a round start (mainline user message)', async () => {
+        const topicId = 't-lobe12011-align';
+        const { lastId } = await seedRounds(topicId, 5, 2); // page boundary lands mid-round
+
+        const result = await messageModel.query({ topicId, current: 0, pageSize: 4 });
+
+        // The page is anchored to the newest turns (the final answer is present)…
+        expect(result.map((m) => m.id)).toContain(lastId);
+        // …its oldest retained row is a user message — no partial round at the top…
+        expect(result[0].role).toBe('user');
+        // …and the slice is a single contiguous parentId chain (renderer-safe), so
+        // FlatListBuilder roots it at one parent and drops nothing.
+        expect(isContiguousChain(result as any)).toBe(true);
+      });
+
+      it('keeps an oversized single round whole rather than trimming to empty', async () => {
+        const topicId = 't-lobe12011-huge';
+        // One round of 1 user + 6 assistant steps = 7 messages; page size 4. The
+        // newest page contains no user message, so the never-empty guard keeps it.
+        const { lastId } = await seedRounds(topicId, 1, 6);
+
+        const result = await messageModel.query({ topicId, current: 0, pageSize: 4 });
+
+        expect(result).toHaveLength(4);
+        expect(result.every((m) => m.role !== 'user')).toBe(true);
+        expect(result.at(-1)!.id).toBe(lastId);
+      });
     });
 
     describe('query with messageQueries', () => {
@@ -1063,24 +1291,30 @@ describe('MessageModel Query Tests', () => {
           current: 0,
           pageSize: 2,
         });
+        // Page 0 returns the NEWEST page, re-sorted ascending: the
+        // two most recent messages, not the two oldest.
         expect(result1).toHaveLength(2);
-        expect(result1[0].id).toBe('msg-page-1'); // ordered by createdAt asc
-        expect(result1[1].id).toBe('msg-page-2');
+        expect(result1[0].id).toBe('msg-page-2');
+        expect(result1[1].id).toBe('msg-page-3');
 
         const result2 = await messageModel.query({
           agentId: 'agent-page',
           current: 1,
           pageSize: 2,
         });
+        // Page 1 walks further back in time to the older remainder.
         expect(result2).toHaveLength(1);
-        expect(result2[0].id).toBe('msg-page-3');
+        expect(result2[0].id).toBe('msg-page-1');
       });
 
-      it('should work with agentId and topicId filters combined', async () => {
+      it('should use topicId as the conversation boundary across agents', async () => {
         await serverDB.transaction(async (trx) => {
           await trx.insert(sessions).values([{ id: 'agent-session', userId }]);
 
-          await trx.insert(agents).values([{ id: 'agent1', userId, title: 'Agent 1' }]);
+          await trx.insert(agents).values([
+            { id: 'agent1', userId, title: 'Agent 1' },
+            { id: 'agent2', userId, title: 'Agent 2' },
+          ]);
 
           await trx
             .insert(agentsToSessions)
@@ -1110,14 +1344,23 @@ describe('MessageModel Query Tests', () => {
               content: 'message in topic2',
               createdAt: new Date('2023-01-02'),
             },
+            {
+              agentId: 'agent2',
+              content: 'cross-agent reply in topic1',
+              createdAt: new Date('2023-01-03'),
+              id: 'msg-topic1-agent2',
+              role: 'assistant',
+              topicId: 'topic1',
+              userId,
+            },
           ]);
         });
 
-        // Query with agentId and topicId
+        // agentId identifies the active/owning agent, but a concrete topic is
+        // the conversation boundary and includes delegated agent replies.
         const result = await messageModel.query({ agentId: 'agent1', topicId: 'topic1' });
 
-        expect(result).toHaveLength(1);
-        expect(result[0].id).toBe('msg-topic1');
+        expect(result.map((message) => message.id)).toEqual(['msg-topic1', 'msg-topic1-agent2']);
       });
 
       it('should only lookup agentsToSessions for current user', async () => {
@@ -2874,6 +3117,466 @@ describe('MessageModel Query Tests', () => {
         expect(agent1Result[1].groupId).toBe('group-1');
         expect(agent2Result[1].groupId).toBe('group-1');
       });
+    });
+  });
+
+  describe('getLastMainThreadSpineMessageId', () => {
+    it('returns the latest non-tool main-thread message in a topic (tools excluded)', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'a1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'step',
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+        {
+          // newest row, but a tool — must NOT be the spine
+          id: 'tool-1',
+          userId,
+          topicId: 'topic1',
+          role: 'tool',
+          parentId: 'a1',
+          content: 'result',
+          createdAt: new Date('2023-01-01T00:00:01'),
+        },
+        {
+          id: 'a2',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'final',
+          createdAt: new Date('2023-01-01T00:00:02'),
+        },
+      ]);
+
+      expect(await messageModel.getLastMainThreadSpineMessageId('topic1')).toBe('a2');
+    });
+
+    it('excludes signal-tagged reactive callbacks', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'a1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'spine',
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+        {
+          id: 'tool-1',
+          userId,
+          topicId: 'topic1',
+          role: 'tool',
+          parentId: 'a1',
+          content: 'result',
+          createdAt: new Date('2023-01-01T00:00:01'),
+        },
+        {
+          // newest, but a Monitor-stdout callback (metadata.signal) — excluded,
+          // so a normal turn doesn't re-mount onto a callback
+          id: 'cb-1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          parentId: 'tool-1',
+          content: 'callback',
+          metadata: {
+            signal: { sourceToolCallId: 'tc', sourceToolName: 'Monitor', type: 'tool-stdout' },
+          },
+          createdAt: new Date('2023-01-01T00:00:02'),
+        },
+      ]);
+
+      expect(await messageModel.getLastMainThreadSpineMessageId('topic1')).toBe('a1');
+    });
+
+    it('excludes subagent-thread messages and scopes to the current user', async () => {
+      const otherModel = new MessageModel(serverDB, otherUserId);
+      await serverDB.transaction(async (trx) => {
+        await trx.insert(sessions).values([{ id: 'session1', userId }]);
+        await trx.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+        await trx.insert(threads).values([
+          {
+            id: 'subagent-thread',
+            userId,
+            topicId: 'topic1',
+            sourceMessageId: 'a1',
+            type: 'standalone',
+          },
+        ]);
+        await trx.insert(messages).values([
+          {
+            id: 'a1',
+            userId,
+            topicId: 'topic1',
+            role: 'assistant',
+            threadId: null,
+            content: 'main',
+            createdAt: new Date('2023-01-01T00:00:00'),
+          },
+          {
+            // newer, but on a subagent thread — must not anchor the main wire
+            id: 'sub-asst',
+            userId,
+            topicId: 'topic1',
+            role: 'assistant',
+            threadId: 'subagent-thread',
+            content: 'subagent',
+            createdAt: new Date('2023-01-01T00:00:01'),
+          },
+        ]);
+      });
+
+      expect(await messageModel.getLastMainThreadSpineMessageId('topic1')).toBe('a1');
+      // another user sees nothing in this topic
+      expect(await otherModel.getLastMainThreadSpineMessageId('topic1')).toBeUndefined();
+    });
+  });
+
+  describe('getLatestSpineMessageId', () => {
+    it('returns the assistant turn, NOT a newer tool result child', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'a1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'final',
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+        {
+          // newest row, but a tool result — an inline child of a1, never the
+          // spine head. A new user turn must parent off the assistant (a1).
+          id: 'tool-1',
+          userId,
+          topicId: 'topic1',
+          role: 'tool',
+          parentId: 'a1',
+          content: 'result',
+          createdAt: new Date('2023-01-01T00:00:01'),
+        },
+      ]);
+
+      expect(await messageModel.getLatestSpineMessageId({ topicId: 'topic1' })).toBe('a1');
+    });
+
+    it('excludes signal-tagged reactive turns', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'a1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'final',
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+        {
+          // newer, but a signal-tagged reactive callback — not part of the spine
+          id: 'sig-1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'monitor callback',
+          metadata: { signal: { type: 'monitor' } } as any,
+          createdAt: new Date('2023-01-01T00:00:01'),
+        },
+      ]);
+
+      expect(await messageModel.getLatestSpineMessageId({ topicId: 'topic1' })).toBe('a1');
+    });
+
+    it('scopes the main thread to threadId IS NULL (ignores thread messages)', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB
+        .insert(threads)
+        .values([
+          { id: 'thread1', userId, topicId: 'topic1', sourceMessageId: 'm1', type: 'standalone' },
+        ]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'm1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          threadId: null,
+          content: 'main tail',
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+        {
+          // newer, but on a thread — must not be the main-thread tail
+          id: 't1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          threadId: 'thread1',
+          content: 'thread tail',
+          createdAt: new Date('2023-01-01T00:00:01'),
+        },
+      ]);
+
+      expect(await messageModel.getLatestSpineMessageId({ topicId: 'topic1' })).toBe('m1');
+      // and when scoped to the thread, returns the thread tail
+      expect(
+        await messageModel.getLatestSpineMessageId({ topicId: 'topic1', threadId: 'thread1' }),
+      ).toBe('t1');
+    });
+
+    it('scopes to the current user and returns undefined for an empty topic', async () => {
+      const otherModel = new MessageModel(serverDB, otherUserId);
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'm1',
+          userId,
+          topicId: 'topic1',
+          role: 'user',
+          content: 'hi',
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+      ]);
+
+      expect(await messageModel.getLatestSpineMessageId({ topicId: 'topic1' })).toBe('m1');
+      // another user sees nothing in this topic
+      expect(await otherModel.getLatestSpineMessageId({ topicId: 'topic1' })).toBeUndefined();
+      // unknown topic yields undefined
+      expect(await messageModel.getLatestSpineMessageId({ topicId: 'nope' })).toBeUndefined();
+    });
+  });
+
+  describe('isMessageDescendantOf', () => {
+    it('distinguishes a newer callback sibling from an advancement of the active branch', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        { id: 'shell', userId, topicId: 'topic1', role: 'assistant', content: '' },
+        {
+          id: 'tool',
+          userId,
+          topicId: 'topic1',
+          role: 'tool',
+          content: 'result',
+          parentId: 'shell',
+        },
+        {
+          id: 'active',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'main',
+          parentId: 'tool',
+        },
+        {
+          id: 'callback',
+          userId,
+          topicId: 'topic1',
+          role: 'taskCallback',
+          content: 'done',
+          parentId: 'shell',
+        },
+        {
+          id: 'callback-reply',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'reactive',
+          parentId: 'callback',
+        },
+      ]);
+
+      expect(
+        await messageModel.isMessageDescendantOf({
+          ancestorId: 'active',
+          descendantId: 'callback-reply',
+          topicId: 'topic1',
+        }),
+      ).toBe(false);
+      expect(
+        await messageModel.isMessageDescendantOf({
+          ancestorId: 'callback',
+          descendantId: 'callback-reply',
+          topicId: 'topic1',
+        }),
+      ).toBe(true);
+    });
+  });
+
+  // Fallback anchor used when `getLatestSpineMessageId` comes back empty. Without
+  // it a new user turn is persisted as a second root and the renderer emits the
+  // newest reply above older messages.
+  describe('getLatestNonToolMessageId', () => {
+    it('returns a toolless signal turn that the spine query skips', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'sig-1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'monitor callback',
+          metadata: { signal: { type: 'monitor' } } as any,
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+      ]);
+
+      // the spine query finds nothing to anchor on...
+      expect(await messageModel.getLatestSpineMessageId({ topicId: 'topic1' })).toBeUndefined();
+      // ...so the fallback keeps the next turn off a second root
+      expect(await messageModel.getLatestNonToolMessageId({ topicId: 'topic1' })).toBe('sig-1');
+    });
+
+    it('never anchors on a tool result, even when it is the newest row', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'sig-1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'callback',
+          metadata: { signal: { type: 'monitor' } } as any,
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+        {
+          id: 'tool-1',
+          userId,
+          topicId: 'topic1',
+          role: 'tool',
+          parentId: 'sig-1',
+          content: 'result',
+          createdAt: new Date('2023-01-01T00:00:01'),
+        },
+      ]);
+
+      expect(await messageModel.getLatestNonToolMessageId({ topicId: 'topic1' })).toBe('sig-1');
+    });
+
+    it('scopes to thread, user, and returns undefined for an empty topic', async () => {
+      const otherModel = new MessageModel(serverDB, otherUserId);
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB
+        .insert(threads)
+        .values([
+          { id: 'thread1', userId, topicId: 'topic1', sourceMessageId: 'm1', type: 'standalone' },
+        ]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'm1',
+          userId,
+          topicId: 'topic1',
+          role: 'user',
+          threadId: null,
+          content: 'main tail',
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+        {
+          id: 't1',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          threadId: 'thread1',
+          content: 'thread tail',
+          createdAt: new Date('2023-01-01T00:00:01'),
+        },
+      ]);
+
+      expect(await messageModel.getLatestNonToolMessageId({ topicId: 'topic1' })).toBe('m1');
+      expect(
+        await messageModel.getLatestNonToolMessageId({ topicId: 'topic1', threadId: 'thread1' }),
+      ).toBe('t1');
+      expect(await otherModel.getLatestNonToolMessageId({ topicId: 'topic1' })).toBeUndefined();
+      expect(await messageModel.getLatestNonToolMessageId({ topicId: 'nope' })).toBeUndefined();
+    });
+  });
+
+  // Regression for the signal-tag exclusion predicate. It used to be
+  // `metadata -> 'signal' IS NULL`, which crashes the production serverless
+  // Postgres engine when used as a WHERE qual (rt_fetch out-of-bounds, SQLSTATE
+  // XX000) and made the agent verifier fail to start. It was rewritten to
+  // `NOT COALESCE(jsonb_exists(metadata, 'signal'), false)`; these lock in the
+  // three metadata shapes the rewrite must handle. Server-DB (node-postgres)
+  // only — the client PGlite path is skipped.
+  describe.skipIf(!isServerDB)('getLatestSpineMessageId — signal predicate regression', () => {
+    it('keeps null and signal-free object metadata, excludes only signal-tagged', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        {
+          // null metadata — a spine candidate, must not be dropped by the predicate
+          id: 'null-meta',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'plain',
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+        {
+          // object metadata without a `signal` key — also a spine candidate
+          id: 'obj-meta',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'has usage',
+          metadata: { usage: { totalTokens: 10 } } as any,
+          createdAt: new Date('2023-01-01T00:00:01'),
+        },
+        {
+          // newest, but signal-tagged — the only row the predicate must exclude
+          id: 'sig-meta',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'callback',
+          metadata: { signal: { type: 'monitor' } } as any,
+          createdAt: new Date('2023-01-01T00:00:02'),
+        },
+      ]);
+
+      // latest non-signal spine row is the signal-free object, not the newer
+      // signal-tagged callback
+      expect(await messageModel.getLatestSpineMessageId({ topicId: 'topic1' })).toBe('obj-meta');
+    });
+
+    it('returns the null-metadata row when it is the only spine candidate', async () => {
+      await serverDB.insert(sessions).values([{ id: 'session1', userId }]);
+      await serverDB.insert(topics).values([{ id: 'topic1', sessionId: 'session1', userId }]);
+      await serverDB.insert(messages).values([
+        {
+          id: 'null-only',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'plain',
+          createdAt: new Date('2023-01-01T00:00:00'),
+        },
+        {
+          id: 'sig-newer',
+          userId,
+          topicId: 'topic1',
+          role: 'assistant',
+          content: 'callback',
+          metadata: { signal: { type: 'monitor' } } as any,
+          createdAt: new Date('2023-01-01T00:00:01'),
+        },
+      ]);
+
+      // guards the COALESCE: a naive `NOT jsonb_exists(metadata, 'signal')` yields
+      // NULL for null metadata and would wrongly drop this row
+      expect(await messageModel.getLatestSpineMessageId({ topicId: 'topic1' })).toBe('null-only');
     });
   });
 });

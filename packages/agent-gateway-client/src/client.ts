@@ -15,7 +15,6 @@ const INITIAL_RECONNECT_DELAY = 1000; // 1s
 const MAX_RECONNECT_DELAY = 30_000; // 30s
 const MAX_MISSED_HEARTBEATS = 3;
 const RESUME_FLUSH_DELAY = 500; // 500ms debounce after last resume event
-const RESUME_TIMEOUT = 3000; // 3s: if no events after resume request, session is already done
 
 // ─── Typed Event Emitter (browser-compatible, no node:events) ───
 
@@ -158,10 +157,24 @@ export class AgentStreamClient extends TypedEmitter {
   }
 
   /**
-   * Update the auth token (e.g. after JWT refresh). Call connect() or wait for auto-reconnect.
+   * Update the auth token used for (re)connections.
+   * Call this after refreshing an expired JWT, then call `reconnect()`.
    */
   updateToken(token: string): void {
     this.token = token;
+  }
+
+  /**
+   * Force a reconnect cycle: tear down the current WebSocket and establish a
+   * fresh connection (which will re-authenticate with the latest token).
+   * Use this after `updateToken()` to recover from `auth_expired`.
+   */
+  async reconnect(): Promise<void> {
+    this.cleanup();
+    this.intentionalDisconnect = false;
+    this.sessionEnded = false;
+    this.reconnectDelay = INITIAL_RECONNECT_DELAY;
+    this.doConnect();
   }
 
   // ─── Connection Logic ───
@@ -221,24 +234,29 @@ export class AgentStreamClient extends TypedEmitter {
           // Enter resume mode only for explicit reconnect scenarios (page reload).
           // Buffer all events until resume replay completes, then deduplicate and emit.
           // This is NOT enabled for normal first-connect to avoid delaying live streaming.
+          //
+          // The replay is terminated by an authoritative `resume_complete` (the
+          // DO's stored status, which survives hibernation) — that message is
+          // what exits resume mode and decides completion. We deliberately do
+          // NOT arm a timeout to guess completion from silence: an empty replay
+          // no longer means "finished" (the DO may simply have hibernated its
+          // event buffer), and guessing was exactly the multi-device
+          // false-cancel bug. If `resume_complete` never arrives (e.g. a
+          // rolled-back DO that predates the authoritative resume_complete fix), we just keep waiting — a
+          // safe, recoverable state, with heartbeat loss still forcing reconnect
+          // — instead of cancelling a live run.
           if (this.resumeOnConnect && !this.lastEventId) {
             this.resumeMode = true;
             this.resumeBuffer = [];
-
-            // Safety timeout: if no events arrive after resume, the session has already
-            // completed and the DO has nothing to replay. Exit resume mode and signal completion.
-            this.resumeFlushTimer = setTimeout(() => {
-              if (this.resumeMode && this.resumeBuffer.length === 0) {
-                this.resumeMode = false;
-                this.sessionEnded = true;
-                this.emit('session_complete');
-                this.disconnect();
-              }
-            }, RESUME_TIMEOUT);
           }
 
-          // Request all buffered events (covers events pushed before WS connected)
-          this.sendMessage({ lastEventId: this.lastEventId, type: 'resume' });
+          // Request all buffered events (covers events pushed before WS connected).
+          // `wantStatus` opts into the authoritative `resume_complete` reply
+          // this client knows how to consume it, so a current
+          // gateway will hand back the real session status. Legacy gateways
+          // ignore the flag and just replay — we then rely on live events, never
+          // guessing completion from silence.
+          this.sendMessage({ lastEventId: this.lastEventId, type: 'resume', wantStatus: true });
           this.emit('connected');
           break;
         }
@@ -246,6 +264,13 @@ export class AgentStreamClient extends TypedEmitter {
         case 'auth_failed': {
           this.emit('auth_failed', message.reason);
           this.disconnect();
+          break;
+        }
+
+        case 'auth_expired': {
+          // Token expired but the server kept the socket open. Don't disconnect —
+          // the listener will refresh the token and call `reconnect()`.
+          this.emit('auth_expired');
           break;
         }
 
@@ -258,13 +283,24 @@ export class AgentStreamClient extends TypedEmitter {
           const agentEvent: AgentStreamEvent = message.event;
           if (message.id) this.lastEventId = message.id;
 
+          // A single WebSocket is multiplexed: alongside this op's events it may
+          // carry forwarded events from other operations (e.g. broadcast council
+          // members mirrored onto the supervisor's channel). A terminal event
+          // ends the SESSION only when it belongs to THIS op — a member
+          // finishing must not disconnect the supervisor's socket and stop
+          // sibling/supervisor streaming. Events with no operationId (legacy
+          // gateway) are treated as this op's, preserving old behavior.
+          const isOwnTerminal =
+            (agentEvent.type === 'agent_runtime_end' || agentEvent.type === 'error') &&
+            (!agentEvent.operationId || agentEvent.operationId === this.operationId);
+
           if (this.resumeMode) {
             // Buffer events during resume — will be deduplicated and emitted after replay
             this.resumeBuffer.push({ event: agentEvent, id: message.id });
             this.scheduleResumeFlush();
 
-            // Terminal events still end the session even in resume mode
-            if (agentEvent.type === 'agent_runtime_end' || agentEvent.type === 'error') {
+            // Only this op's terminal ends the session (even in resume mode).
+            if (isOwnTerminal) {
               this.sessionEnded = true;
               this.flushResumeBuffer();
               this.disconnect();
@@ -274,11 +310,44 @@ export class AgentStreamClient extends TypedEmitter {
 
           this.emit('agent_event', agentEvent);
 
-          // Terminal events — session is done, no need to reconnect
-          if (agentEvent.type === 'agent_runtime_end' || agentEvent.type === 'error') {
+          // This op's terminal — session is done, no need to reconnect. A
+          // forwarded member terminal is still emitted above (so its handler can
+          // finalize that member) but must NOT tear down this connection.
+          if (isOwnTerminal) {
             this.sessionEnded = true;
             this.disconnect();
           }
+          break;
+        }
+
+        case 'resume_complete': {
+          // Authoritative status from the DO, sent right after resume replay
+          // — this is the definitive end-of-replay marker, so
+          // cancel the pending debounce flush and act on it immediately.
+          if (this.resumeFlushTimer) {
+            clearTimeout(this.resumeFlushTimer);
+            this.resumeFlushTimer = null;
+          }
+
+          // Emit any events buffered during resume, in order, before deciding.
+          if (this.resumeMode) {
+            this.flushResumeBuffer();
+          }
+
+          const terminal =
+            message.status === 'completed' ||
+            message.status === 'error' ||
+            message.status === 'interrupted';
+
+          if (terminal) {
+            this.sessionEnded = true;
+            this.emit('session_complete');
+            this.disconnect();
+          }
+          // Non-terminal (running / waiting_input / waiting_confirmation): the
+          // run is alive. Stay connected and keep streaming live events — do NOT
+          // fire session_complete. This is the core fix: a fresh subscriber on a
+          // hibernated DO no longer false-completes and clears runningOperation.
           break;
         }
 

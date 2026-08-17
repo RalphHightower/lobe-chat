@@ -1,14 +1,14 @@
 'use client';
 
-import { ENABLE_BUSINESS_FEATURES } from '@lobechat/business-const';
-import { ActionIcon, Flexbox, InputNumber, Segmented } from '@lobehub/ui';
+import { ActionIcon, Flexbox, InputNumber } from '@lobehub/ui';
+import { Tabs, type TabsItem } from '@lobehub/ui/base-ui';
 import { Check, Plus, X } from 'lucide-react';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { useImageStore } from '@/store/image';
 import { imageGenerationConfigSelectors } from '@/store/image/selectors';
+import { serverConfigSelectors, useServerConfigStore } from '@/store/serverConfig';
 
-const DEFAULT_IMAGE_NUM_MAX = ENABLE_BUSINESS_FEATURES ? 8 : 50;
 const CUSTOM_VALUE = '__custom__';
 
 interface ImageNumSelectorProps {
@@ -19,9 +19,13 @@ interface ImageNumSelectorProps {
 }
 
 const ImageNum = memo<ImageNumSelectorProps>(
-  ({ presetCounts = [1, 2, 4, 8], min = 1, max = DEFAULT_IMAGE_NUM_MAX, disabled = false }) => {
+  ({ presetCounts = [1, 2, 4, 8], min = 1, max, disabled = false }) => {
     const imageNum = useImageStore(imageGenerationConfigSelectors.imageNum);
     const setImageNum = useImageStore((s) => s.setImageNum);
+    const enableBusinessFeatures = useServerConfigStore(
+      serverConfigSelectors.enableBusinessFeatures,
+    );
+    const resolvedMax = max ?? (enableBusinessFeatures ? 8 : 50);
     const [isEditing, setIsEditing] = useState(false);
     const [customCount, setCustomCount] = useState<number | null>(null);
     const customCountRef = useRef<number | null>(null);
@@ -29,39 +33,37 @@ const ImageNum = memo<ImageNumSelectorProps>(
 
     const isCustomValue = !presetCounts.includes(imageNum);
 
-    const options = useMemo(() => {
-      const items = presetCounts.map((count) => ({
+    const options = useMemo<TabsItem[]>(() => {
+      const items: TabsItem[] = presetCounts.map((count) => ({
+        key: String(count),
         label: String(count),
-        value: count,
       }));
 
-      // Add custom option or show current custom value
       if (isCustomValue) {
         items.push({
+          key: String(imageNum),
           label: String(imageNum),
-          value: imageNum,
         });
       } else {
         items.push({
+          key: CUSTOM_VALUE,
           label: <Plus size={16} style={{ verticalAlign: 'middle' }} />,
-          value: CUSTOM_VALUE,
-        } as any);
+        });
       }
 
       return items;
     }, [presetCounts, isCustomValue, imageNum]);
 
     const handleChange = useCallback(
-      (value: number | string) => {
+      (key: string) => {
         if (disabled) return;
 
-        if (value === CUSTOM_VALUE || (isCustomValue && value === imageNum)) {
-          // Enter edit mode
+        if (key === CUSTOM_VALUE || (isCustomValue && Number(key) === imageNum)) {
           setCustomCount(imageNum);
           customCountRef.current = imageNum;
           setIsEditing(true);
         } else {
-          setImageNum(value as number);
+          setImageNum(Number(key));
         }
       },
       [disabled, isCustomValue, imageNum, setImageNum],
@@ -75,8 +77,8 @@ const ImageNum = memo<ImageNumSelectorProps>(
         return;
       }
 
-      if (count > max) {
-        count = max;
+      if (count > resolvedMax) {
+        count = resolvedMax;
       } else if (count < min) {
         count = min;
       }
@@ -84,7 +86,7 @@ const ImageNum = memo<ImageNumSelectorProps>(
       setImageNum(count);
       setIsEditing(false);
       setCustomCount(null);
-    }, [min, max, setImageNum]);
+    }, [min, resolvedMax, setImageNum]);
 
     const handleCustomCancel = useCallback(() => {
       setIsEditing(false);
@@ -123,9 +125,9 @@ const ImageNum = memo<ImageNumSelectorProps>(
       return (
         <Flexbox horizontal gap={8} style={{ width: '100%' }}>
           <InputNumber
-            max={max}
+            max={resolvedMax}
             min={min}
-            placeholder={`${min}-${max}`}
+            placeholder={`${min}-${resolvedMax}`}
             ref={inputRef}
             size="small"
             style={{ flex: 1 }}
@@ -152,13 +154,14 @@ const ImageNum = memo<ImageNumSelectorProps>(
     }
 
     return (
-      <Segmented
-        block
-        disabled={disabled}
-        options={options}
+      <Tabs
+        activeKey={String(imageNum)}
+        items={options.map((item) => ({ ...item, disabled }))}
         style={{ width: '100%' }}
-        value={isCustomValue ? imageNum : imageNum}
-        variant="filled"
+        styles={{
+          list: { display: 'flex', width: '100%' },
+          tab: { flex: 1 },
+        }}
         onChange={handleChange}
       />
     );

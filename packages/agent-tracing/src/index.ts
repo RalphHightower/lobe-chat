@@ -1,5 +1,20 @@
+export {
+  type ContextLintFeatures,
+  type ContextLintResult,
+  type LintFinding,
+  lintSnapshot,
+  resolvePayloads,
+} from './analysis/contextLint';
+export {
+  buildContextMap,
+  type ContextCall,
+  type ContextMap,
+  type ContextSegment,
+  type SegmentKind,
+} from './analysis/contextMap';
 export { appendStepToPartial, finalizeSnapshot } from './recorder';
 export { FileSnapshotStore } from './store/file-store';
+export { isOperationId, parseOperationId } from './store/remote-store';
 export type { ISnapshotStore } from './store/types';
 export type { ExecutionSnapshot, SnapshotSummary, StepSnapshot } from './types';
 export {
@@ -17,3 +32,5 @@ export {
   renderStepDetail,
   renderSummaryTable,
 } from './viewer';
+export { renderContextMap } from './viewer/contextMap';
+export { renderContextMapHtml } from './viewer/contextMapHtml';

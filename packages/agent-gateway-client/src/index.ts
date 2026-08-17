@@ -1,5 +1,7 @@
 export { AgentStreamClient } from './client';
 export type {
+  AgentInterventionRequestData,
+  AgentInterventionResponseData,
   AgentStreamClientEvents,
   AgentStreamClientOptions,
   AgentStreamEvent,
@@ -9,8 +11,10 @@ export type {
   StreamChunkData,
   StreamChunkType,
   StreamStartData,
+  SubAgentProgressData,
   ToolEndData,
   ToolExecuteData,
   ToolResultMessage,
   ToolStartData,
+  ToolStateChunkData,
 } from './types';

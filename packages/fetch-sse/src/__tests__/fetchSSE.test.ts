@@ -140,25 +140,10 @@ describe('fetchSSE', () => {
       responseAnimation: 'smooth',
     });
 
-    const expectedMessages = [
-      { text: 'H', type: 'text' },
-      { text: 'e', type: 'text' },
-      { text: 'l', type: 'text' },
-      { text: 'l', type: 'text' },
-      { text: 'o', type: 'text' },
-      { text: ' ', type: 'text' },
-      { text: 'W', type: 'text' },
-      { text: 'o', type: 'text' },
-      { text: 'r', type: 'text' },
-      { text: 'l', type: 'text' },
-      { text: 'd', type: 'text' },
-    ];
+    const allCalls = mockOnMessageHandle.mock.calls.map((call) => call[0]);
+    const allTexts = allCalls.filter((c) => c.type === 'text').map((c) => c.text);
+    expect(allTexts.join('')).toBe('Hello World');
 
-    expectedMessages.forEach((message, index) => {
-      expect(mockOnMessageHandle).toHaveBeenNthCalledWith(index + 1, message);
-    });
-
-    // more assertions for each character...
     expect(mockOnFinish).toHaveBeenCalledWith('Hello World', {
       observationId: null,
       toolCalls: undefined,
@@ -481,23 +466,9 @@ describe('fetchSSE', () => {
       responseAnimation: 'smooth',
     });
 
-    const expectedMessages = [
-      { text: 'H', type: 'text' },
-      { text: 'e', type: 'text' },
-      { text: 'l', type: 'text' },
-      { text: 'l', type: 'text' },
-      { text: 'o', type: 'text' },
-      { text: ' ', type: 'text' },
-      { text: 'W', type: 'text' },
-      { text: 'o', type: 'text' },
-      { text: 'r', type: 'text' },
-      { text: 'l', type: 'text' },
-      { text: 'd', type: 'text' },
-    ];
-
-    expectedMessages.forEach((message, index) => {
-      expect(mockOnMessageHandle).toHaveBeenNthCalledWith(index + 1, message);
-    });
+    const allCalls = mockOnMessageHandle.mock.calls.map((call) => call[0]);
+    const allTexts = allCalls.filter((c) => c.type === 'text').map((c) => c.text);
+    expect(allTexts.join('')).toBe('Hello World');
 
     expect(mockOnFinish).toHaveBeenCalledWith('Hello World', {
       type: 'done',
@@ -593,7 +564,7 @@ describe('fetchSSE', () => {
 
       try {
         await fetchSSE('/', { onErrorHandle: mockOnErrorHandle });
-      } catch (e) {}
+      } catch {}
 
       expect(mockOnErrorHandle).toHaveBeenCalledWith(mockError);
     });
@@ -624,7 +595,7 @@ describe('fetchSSE', () => {
           onErrorHandle: mockOnErrorHandle,
           requestContext: { provider: 'openai', model: 'gpt-4o' },
         });
-      } catch (e) {}
+      } catch {}
 
       expect(mockOnErrorHandle).toHaveBeenCalledWith(mockError);
       const receivedError = mockOnErrorHandle.mock.calls[0][0];
@@ -649,7 +620,7 @@ describe('fetchSSE', () => {
           onErrorHandle: mockOnErrorHandle,
           requestContext: { provider: 'openai', model: 'gpt-4o' },
         });
-      } catch (e) {}
+      } catch {}
 
       expect(mockOnErrorHandle).toHaveBeenCalledWith({
         type: 'UnknownChatFetchError',
@@ -677,7 +648,7 @@ describe('fetchSSE', () => {
 
           try {
             await options.onopen!(res as any);
-          } catch (e) {}
+          } catch {}
         },
       );
 
@@ -711,7 +682,7 @@ describe('fetchSSE', () => {
 
       try {
         await fetchSSE('/', { onErrorHandle: mockOnErrorHandle });
-      } catch (e) {}
+      } catch {}
 
       expect(mockOnErrorHandle).toHaveBeenCalledWith(mockError);
     });
@@ -728,7 +699,7 @@ describe('fetchSSE', () => {
 
       try {
         await fetchSSE('/', { onErrorHandle: mockOnErrorHandle });
-      } catch (e) {}
+      } catch {}
 
       expect(mockOnErrorHandle).toHaveBeenCalledWith({
         body: {

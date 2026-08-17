@@ -17,11 +17,8 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-vi.mock('@lobehub/ui', () => ({
-  Flexbox: ({ children, ...props }: HTMLAttributes<HTMLDivElement>) => (
-    <div {...props}>{children}</div>
-  ),
-  Modal: ({
+vi.mock('@/components/ImperativeModal', () => ({
+  default: ({
     cancelText,
     children,
     okText,
@@ -43,6 +40,12 @@ vi.mock('@lobehub/ui', () => ({
         {children}
       </div>
     ) : null,
+}));
+
+vi.mock('@lobehub/ui', () => ({
+  Flexbox: ({ children, ...props }: HTMLAttributes<HTMLDivElement>) => (
+    <div {...props}>{children}</div>
+  ),
   Text: ({ children, ...props }: HTMLAttributes<HTMLSpanElement>) => (
     <span {...props}>{children}</span>
   ),
@@ -74,9 +77,6 @@ vi.mock('antd', () => {
         },
       }),
     },
-    Checkbox: ({ checked }: { checked?: boolean }) => (
-      <input readOnly checked={checked} role="checkbox" type="checkbox" />
-    ),
     List,
   };
 });
@@ -109,19 +109,19 @@ describe('ClaimResourcesModal', () => {
     );
 
     await waitFor(() => {
-      const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
+      const checkboxes = screen.getAllByRole('checkbox');
 
-      expect(checkboxes[0].checked).toBe(true);
-      expect(checkboxes[1].checked).toBe(true);
+      expect(checkboxes[0]).toHaveAttribute('aria-checked', 'true');
+      expect(checkboxes[1]).toHaveAttribute('aria-checked', 'true');
     });
 
     fireEvent.click(screen.getByText('plugin-a'));
 
     await waitFor(() => {
-      const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
+      const checkboxes = screen.getAllByRole('checkbox');
 
-      expect(checkboxes[0].checked).toBe(false);
-      expect(checkboxes[1].checked).toBe(true);
+      expect(checkboxes[0]).toHaveAttribute('aria-checked', 'false');
+      expect(checkboxes[1]).toHaveAttribute('aria-checked', 'true');
     });
 
     rerender(
@@ -136,12 +136,12 @@ describe('ClaimResourcesModal', () => {
     );
 
     await waitFor(() => {
-      const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
+      const checkboxes = screen.getAllByRole('checkbox');
 
       expect(screen.queryByText('plugin-a')).toBeNull();
       expect(screen.getByText('plugin-b')).toBeTruthy();
-      expect(checkboxes[0].checked).toBe(true);
-      expect(checkboxes[1].checked).toBe(true);
+      expect(checkboxes[0]).toHaveAttribute('aria-checked', 'true');
+      expect(checkboxes[1]).toHaveAttribute('aria-checked', 'true');
     });
   });
 });

@@ -1,5 +1,6 @@
 import type { GroundingSearch } from '../../search';
 import type { ThreadStatus } from '../../topic/thread';
+import type { WorkSummaryItem } from '../../work';
 import type {
   ChatImageItem,
   ChatMessageError,
@@ -14,6 +15,7 @@ import type {
   ChatToolPayloadWithResult,
   ToolIntervention,
 } from '../common/tools';
+import type { ChatAudioItem } from './audio';
 import type { ChatMessageExtra } from './extra';
 import type { ChatFileChunk } from './rag';
 import type { ChatVideoItem } from './video';
@@ -30,12 +32,21 @@ export type UIMessageRoleType =
   | 'assistantGroup'
   | 'agentCouncil'
   | 'compressedGroup'
-  | 'compareGroup';
+  | 'compareGroup'
+  | 'verify'
+  | 'taskCallback';
 
 export interface ChatFileItem {
   content?: string;
   fileType: string;
   id: string;
+  /**
+   * The viewer lost access to the referenced file (e.g. its owner switched a
+   * workspace-shared file back to private after it was used in a shared
+   * conversation). The server tombstones the row — id only, no name/url — and
+   * the UI renders a no-access placeholder card instead of the file card.
+   */
+  inaccessible?: boolean;
   name: string;
   size: number;
   url: string;
@@ -84,6 +95,13 @@ export interface TaskBlock {
 
 export interface AssistantContentBlock {
   content: string;
+  /**
+   * Multi-agent broadcast members rendered inline as a single AgentCouncil block
+   * (parallel columns) within the supervisor's assistant group — instead of a
+   * separate top-level `agentCouncil` message. Set on a dedicated council block
+   * that carries no own content/tools.
+   */
+  council?: UIChatMessage[];
   error?: ChatMessageError | null;
   fileList?: ChatFileItem[];
   id: string;
@@ -106,6 +124,34 @@ interface UIMessageBranch {
   activeBranchIndex: number;
   /** Total number of branches */
   count: number;
+}
+
+/**
+ * Snapshot of a single toolless assistant callback inside a
+ * {@link UISignalCallbacksBlock}. The snapshot is denormalized at
+ * FlatListBuilder time so the renderer doesn't have to round-trip
+ * through the messages map.
+ */
+export interface UISignalCallback {
+  content: string;
+  id: string;
+  model?: string | null;
+  provider?: string | null;
+  /** Nth push from the same source (1-based, matches metadata.signal.sequence). */
+  sequence?: number;
+}
+
+/**
+ * Group of callback turns attached to one source tool, denormalized
+ * onto a virtual `assistantGroup` message by FlatListBuilder. One
+ * block per source tool — multiple callback-firing tools in the same
+ * group produce multiple blocks.
+ */
+export interface UISignalCallbacksBlock {
+  callbacks: UISignalCallback[];
+  sourceToolCallId: string;
+  sourceToolMessageId: string;
+  sourceToolName: string;
 }
 
 /**
@@ -141,9 +187,17 @@ export interface TaskDetail {
   totalToolCalls?: number;
 }
 
+export interface MessageSender {
+  avatar?: string | null;
+  fullName?: string | null;
+  id: string;
+  username?: string | null;
+}
+
 export interface UIChatMessage {
   // Group chat fields (alphabetically before other fields)
   agentId?: string | 'supervisor';
+  audioList?: ChatAudioItem[];
   /**
    * Branch information for user messages with multiple children
    */
@@ -223,11 +277,46 @@ export interface UIChatMessage {
    */
   role: UIMessageRoleType;
   search?: GroundingSearch | null;
+  /**
+   * The workspace member who authored this message. Populated by the server
+   * query via a users LEFT JOIN. `null` for messages whose author account was
+   * deleted (rare — `messages.user_id` cascades on delete, so this is mainly
+   * a safety fallback) or for messages returned by paths that don't hydrate
+   * this field yet (streaming/optimistic client messages).
+   *
+   * Used by the User bubble to render the actual sender's avatar in
+   * workspace-shared topics instead of hard-coding the viewer's own avatar.
+   */
+  sender?: MessageSender | null;
   sessionId?: string;
+  /**
+   * External-signal callback blocks (). Set on virtual
+   * assistantGroup messages built by FlatListBuilder when the chain
+   * contains toolless assistants triggered by repeated tool_results
+   * (Monitor stdout push pattern). Rendered as `<SignalCallbacks>`
+   * blocks inside the AssistantGroup, separate from the main chain.
+   *
+   * Each entry corresponds to one source tool; multiple source tools
+   * in the same group produce multiple entries.
+   */
+  signalCallbacks?: UISignalCallbacksBlock[];
   /**
    * target member ID for DM messages in group chat
    */
   targetId?: string | null;
+  /**
+   * Post-task summary blocks (). Set on virtual assistantGroup
+   * messages by FlatListBuilder when the chain contains toolless
+   * assistants tagged with `signal.type === 'task-completion'` — the
+   * final-summary turn the LLM emits after CC delivers
+   * `system task_notification` for a long-running tool (Monitor, etc.).
+   *
+   * Rendered after `<SignalCallbacks>` so the natural narrative inside
+   * the same AssistantGroup reads: initial reply → callback accordion →
+   * summary. Multiple entries are possible (rare) if several tools
+   * completed within one LLM run.
+   */
+  taskCompletions?: AssistantContentBlock[];
   /**
    * Task execution details for role='task' messages
    * Retrieved from the associated Thread via sourceMessageId
@@ -257,4 +346,12 @@ export interface UIChatMessage {
    */
   usage?: ModelUsage;
   videoList?: ChatVideoItem[];
+  /**
+   * Work summaries produced by this message's root operation, resolved
+   * server-side and attached by `metadata.work.rootOperationId`. Rides the
+   * message-list payload so the in-message Works chips and the sidebar's
+   * summary view read from one source instead of a separate work-summary
+   * fetch. Empty/omitted when the message produced no Work.
+   */
+  works?: WorkSummaryItem[];
 }

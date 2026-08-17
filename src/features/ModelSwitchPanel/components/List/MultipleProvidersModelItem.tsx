@@ -31,6 +31,7 @@ interface MultipleProvidersModelItemProps {
   defaultProviderId?: string;
   isModelRestricted?: (modelId: string, providerId: string) => boolean;
   newLabel: string;
+  onBeforeModelSelect?: (modelId: string, providerId: string) => boolean | Promise<boolean>;
   onClose: () => void;
   onModelChange: (modelId: string, providerId: string) => void;
   onRestrictedModelClick?: () => void;
@@ -44,6 +45,7 @@ export const MultipleProvidersModelItem = memo<MultipleProvidersModelItemProps>(
     data,
     isModelRestricted,
     newLabel,
+    onBeforeModelSelect,
     onModelChange,
     onClose,
     onRestrictedModelClick,
@@ -55,11 +57,23 @@ export const MultipleProvidersModelItem = memo<MultipleProvidersModelItemProps>(
 
     const activeProvider = data.providers.find((p) => menuKey(p.id, data.model.id) === activeKey);
     const isActive = !!activeProvider;
+    const defaultProvider = data.providers[0];
+    const defaultProviderRestricted = Boolean(
+      defaultProvider && isModelRestricted?.(data.model.id, defaultProvider.id),
+    );
 
     const allRestricted =
       isModelRestricted &&
       data.providers.length > 0 &&
       data.providers.every((p) => isModelRestricted(data.model.id, p.id));
+
+    const selectModel = async (providerId: string) => {
+      setSubmenuOpen(false);
+      onClose();
+      if ((await onBeforeModelSelect?.(data.model.id, providerId)) === false) return;
+
+      onModelChange(data.model.id, providerId);
+    };
 
     return (
       <DropdownMenuSubmenuRoot
@@ -73,21 +87,23 @@ export const MultipleProvidersModelItem = memo<MultipleProvidersModelItemProps>(
           className={cx(menuSharedStyles.item, isActive && styles.menuItemActive)}
           style={{ paddingBlock: 8, paddingInline: 8 }}
           onClick={() => {
-            if (allRestricted) {
+            if (defaultProviderRestricted) {
               onRestrictedModelClick?.();
               onClose();
               return;
             }
-            setSubmenuOpen(false);
-            onModelChange(data.model.id, data.providers[0].id);
-            onClose();
+            if (!defaultProvider) {
+              onClose();
+              return;
+            }
+            void selectModel(defaultProvider.id);
           }}
         >
           <ModelItemRender
             {...data.model}
             {...data.model.abilities}
             newBadgeLabel={newLabel}
-            proBadgeLabel={allRestricted ? proLabel : undefined}
+            proBadgeLabel={defaultProviderRestricted ? proLabel : undefined}
             showInfoTag={showInfoTag}
           />
         </DropdownMenuSubmenuTrigger>
@@ -116,9 +132,7 @@ export const MultipleProvidersModelItem = memo<MultipleProvidersModelItemProps>(
                           onClose();
                           return;
                         }
-                        setSubmenuOpen(false);
-                        onClose();
-                        onModelChange(data.model.id, p.id);
+                        void selectModel(p.id);
                       }}
                     >
                       <DropdownMenuItemIcon>

@@ -2,7 +2,14 @@ import type { ChatTopic } from '@lobechat/types';
 import dayjs from 'dayjs';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { groupTopicsByTime, groupTopicsByUpdatedTime } from './topic';
+import {
+  getTopicWorkingDirectoryEffectivePath,
+  getTopicWorkingDirectorySourcePath,
+  groupTopicsByProject,
+  groupTopicsByStatus,
+  groupTopicsByTime,
+  groupTopicsByUpdatedTime,
+} from './topic';
 
 // Mock current date to ensure consistent test results
 const NOW = '2024-01-15T12:00:00Z';
@@ -212,5 +219,222 @@ describe('groupTopicsByUpdatedTime', () => {
 
     // By updatedAt: grouped under yesterday
     expect(byUpdated[0].id).toBe('yesterday');
+  });
+
+  it('should group and sort by sortUpdatedAt (activity time) when present, ignoring updatedAt', () => {
+    const lastYear = dayjs().subtract(1, 'year').valueOf();
+    const today = dayjs().valueOf();
+
+    // Row was edited last year (updatedAt) but had message activity today
+    // (sortUpdatedAt) — the sidebar must group it under "today".
+    const topic: ChatTopic = {
+      id: 'active',
+      title: 'Recently active',
+      createdAt: lastYear,
+      updatedAt: lastYear,
+      sortUpdatedAt: today,
+    };
+
+    const result = groupTopicsByUpdatedTime([topic]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('today');
+  });
+
+  it('should order rows by sortUpdatedAt (activity) over updatedAt (row edit time)', () => {
+    const base = dayjs().subtract(1, 'month').valueOf();
+    // `a` has an older row edit time but newer activity → must sort first.
+    const a: ChatTopic = {
+      id: 'a',
+      title: 'Older edit, newer activity',
+      createdAt: base,
+      updatedAt: dayjs().hour(9).valueOf(),
+      sortUpdatedAt: dayjs().hour(11).valueOf(),
+    };
+    const b: ChatTopic = {
+      id: 'b',
+      title: 'Newer edit, older activity',
+      createdAt: base,
+      updatedAt: dayjs().hour(10).valueOf(),
+      sortUpdatedAt: dayjs().hour(10).valueOf(),
+    };
+
+    const result = groupTopicsByUpdatedTime([b, a]);
+
+    expect(result[0].children.map((t) => t.id)).toEqual(['a', 'b']);
+  });
+});
+
+describe('working directory topic helpers', () => {
+  const createTopic = (
+    id: string,
+    metadata: ChatTopic['metadata'],
+    updatedAt: number = 0,
+  ): ChatTopic => ({
+    createdAt: updatedAt,
+    id,
+    metadata,
+    title: id,
+    updatedAt,
+  });
+
+  it('preserves source and effective paths for worktree topics', () => {
+    const topic = createTopic('worktree', {
+      workingDirectory: '/repo-fix',
+      workingDirectoryConfig: {
+        git: { activeWorktree: '/repo-fix', branch: 'fix', isWorktree: true },
+        path: '/repo',
+        repoType: 'git',
+      },
+    });
+
+    expect(getTopicWorkingDirectorySourcePath(topic)).toBe('/repo');
+    expect(getTopicWorkingDirectoryEffectivePath(topic)).toBe('/repo-fix');
+  });
+
+  it('tolerates a legacy object-form workingDirectory without crashing', () => {
+    // Some heterogeneous (Claude Code) topics persisted a `WorkingDirConfig`
+    // object into `workingDirectory` even though the field is typed as a string.
+    // The helpers must extract its path instead of calling `dir.trim()` on it.
+    const topic = createTopic('legacy-object', {
+      workingDirectory: { path: '/Users/xxx/项目目录', repoType: 'git' },
+    } as unknown as ChatTopic['metadata']);
+
+    expect(getTopicWorkingDirectorySourcePath(topic)).toBe('/Users/xxx/项目目录');
+    expect(getTopicWorkingDirectoryEffectivePath(topic)).toBe('/Users/xxx/项目目录');
+    expect(() => groupTopicsByProject([topic], 'updatedAt')).not.toThrow();
+    expect(groupTopicsByProject([topic], 'updatedAt')[0]).toMatchObject({
+      id: 'project:/Users/xxx/项目目录',
+      title: '项目目录',
+    });
+  });
+
+  it('groups worktree topics under the source project', () => {
+    const topics = [
+      createTopic(
+        'worktree',
+        {
+          workingDirectory: '/repo-fix',
+          workingDirectoryConfig: {
+            git: { activeWorktree: '/repo-fix', branch: 'fix', isWorktree: true },
+            path: '/repo',
+            repoType: 'git',
+          },
+        },
+        2,
+      ),
+      createTopic('source', { workingDirectory: '/repo' }, 1),
+    ];
+
+    const result = groupTopicsByProject(topics, 'updatedAt');
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ id: 'project:/repo', title: 'repo' });
+    expect(result[0].children.map((topic) => topic.id)).toEqual(['worktree', 'source']);
+  });
+});
+
+describe('groupTopicsByStatus', () => {
+  const createTopic = (
+    id: string,
+    status: ChatTopic['status'],
+    updatedAt: number = 0,
+  ): ChatTopic => ({
+    id,
+    title: id,
+    createdAt: updatedAt,
+    status,
+    updatedAt,
+  });
+
+  it('should return empty array for empty input', () => {
+    expect(groupTopicsByStatus([], 'updatedAt')).toEqual([]);
+  });
+
+  it('should order groups by fixed priority: pending, running, then active', () => {
+    const topics = [
+      createTopic('a', 'active'),
+      createTopic('r', 'running'),
+      createTopic('w', 'waitingForHuman'),
+    ];
+
+    const result = groupTopicsByStatus(topics, 'updatedAt');
+
+    expect(result.map((g) => g.id)).toEqual(['pending', 'running', 'active']);
+  });
+
+  it('should collapse waitingForHuman and failed into the pending bucket', () => {
+    const topics = [
+      createTopic('w', 'waitingForHuman', 2),
+      createTopic('f', 'failed', 1),
+      createTopic('a', 'active'),
+    ];
+
+    const result = groupTopicsByStatus(topics, 'updatedAt');
+
+    expect(result.map((g) => g.id)).toEqual(['pending', 'active']);
+    expect(result[0].children.map((t) => t.id)).toEqual(['w', 'f']);
+  });
+
+  it('should bucket an unread completion as pending while read completions stay completed', () => {
+    const topics = [createTopic('unread', 'unread'), createTopic('read', 'completed')];
+
+    const result = groupTopicsByStatus(topics, 'updatedAt');
+
+    expect(result.map((g) => g.id)).toEqual(['pending', 'completed']);
+    expect(result[0].children.map((t) => t.id)).toEqual(['unread']);
+    expect(result[1].children.map((t) => t.id)).toEqual(['read']);
+  });
+
+  it('should bucket topics without a status as active', () => {
+    const topics = [createTopic('1', undefined), createTopic('2', null)];
+
+    const result = groupTopicsByStatus(topics, 'updatedAt');
+
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('active');
+    expect(result[0].children.map((t) => t.id)).toEqual(['1', '2']);
+  });
+
+  it('should only emit non-empty groups and keep the remaining states below the priority ones', () => {
+    const topics = [
+      createTopic('c', 'completed'),
+      createTopic('w', 'waitingForHuman'),
+      createTopic('a', 'archived'),
+    ];
+
+    const result = groupTopicsByStatus(topics, 'updatedAt');
+
+    expect(result.map((g) => g.id)).toEqual(['pending', 'completed', 'archived']);
+  });
+
+  it('should sort topics inside a group by the chosen field desc', () => {
+    const topics = [
+      createTopic('old', 'running', 1),
+      createTopic('new', 'running', 100),
+      createTopic('mid', 'running', 50),
+    ];
+
+    const result = groupTopicsByStatus(topics, 'updatedAt');
+
+    expect(result[0].children.map((t) => t.id)).toEqual(['new', 'mid', 'old']);
+  });
+
+  it('should bucket a topic that is streaming on this client (loadingTopicIds) as running', () => {
+    const topics = [createTopic('loading', 'active'), createTopic('idle', 'active')];
+
+    const result = groupTopicsByStatus(topics, 'updatedAt', new Set(['loading']));
+
+    expect(result.map((g) => g.id)).toEqual(['running', 'active']);
+    expect(result[0].children.map((t) => t.id)).toEqual(['loading']);
+    expect(result[1].children.map((t) => t.id)).toEqual(['idle']);
+  });
+
+  it('should keep a loading topic in pending (it outranks the running overlay)', () => {
+    const topics = [createTopic('waiting', 'waitingForHuman')];
+
+    const result = groupTopicsByStatus(topics, 'updatedAt', new Set(['waiting']));
+
+    expect(result.map((g) => g.id)).toEqual(['pending']);
   });
 });

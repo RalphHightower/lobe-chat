@@ -11,7 +11,7 @@ import {
   formatMoveResults,
   formatRenameResult,
   formatWriteResult,
-} from '@lobechat/prompts';
+} from '@lobechat/prompts/fileSystem';
 import type { BuiltinServerRuntimeOutput } from '@lobechat/types';
 
 import type {
@@ -41,6 +41,8 @@ import type {
   WriteFileParams,
   WriteFileState,
 } from './types';
+
+const MAX_AGENT_GLOB_RESULTS = 1000;
 
 /**
  * ComputerRuntime — abstract base for computer operations (file system, shell, search).
@@ -106,6 +108,32 @@ export abstract class ComputerRuntime {
       }
 
       const r = result.result || {};
+
+      // Image file: `local-file-shell`'s readLocalFile refuses binary, so the
+      // IPC layer uploads the bytes to file storage and returns a durable
+      // reference instead. Carry it on `state.images` — the MessageContent
+      // tool-message processor turns the uploaded URL into an `image_url`
+      // part so vision-capable models can actually see the image.
+      if (r.isImage && r.imageUrl) {
+        const filename = r.filename || args.path;
+        const placeholder = r.content || `[Image: ${filename}]`;
+        const state: ReadFileState = {
+          content: placeholder,
+          filename,
+          fileType: r.fileType,
+          images: [
+            { fileId: r.imageFileId, mediaType: r.fileType || 'image/png', url: r.imageUrl },
+          ],
+          path: args.path,
+        };
+
+        return {
+          content: placeholder,
+          state,
+          success: true,
+        };
+      }
+
       const fileContent = r.content || '';
 
       const state: ReadFileState = {
@@ -298,12 +326,17 @@ export abstract class ComputerRuntime {
       if (!result.success) {
         return this.errorOutput(result, {
           error: result.error?.message,
+          exitCode: result.result?.exitCode ?? result.result?.exit_code,
           isBackground: args.background || false,
+          stderr: result.result?.stderr,
+          stdout: result.result?.stdout,
           success: false,
         });
       }
 
       const r = result.result || {};
+      const commandSuccess = typeof r.success === 'boolean' ? r.success : result.success;
+      const outputFiles = r.outputFiles ?? r.output_files;
 
       const state: RunCommandState = {
         commandId: r.commandId || r.shell_id,
@@ -311,18 +344,21 @@ export abstract class ComputerRuntime {
         exitCode: r.exitCode ?? r.exit_code,
         isBackground: args.background || false,
         output: r.output,
+        outputFiles,
+        sandboxed: r.sandboxed,
         stderr: r.stderr,
         stdout: r.stdout,
-        success: result.success,
+        success: commandSuccess,
       };
 
       const content = formatCommandResult({
         error: r.error,
         exitCode: r.exitCode ?? r.exit_code,
+        outputFiles,
         shellId: r.commandId || r.shell_id,
         stderr: r.stderr,
         stdout: r.stdout || r.output,
-        success: result.success,
+        success: commandSuccess,
       });
 
       return { content, state, success: true };
@@ -338,25 +374,34 @@ export abstract class ComputerRuntime {
       if (!result.success) {
         return this.errorOutput(result, {
           error: result.error?.message,
-          running: false,
           success: false,
         });
       }
 
       const r = result.result || {};
+      const outputSuccess = typeof r.success === 'boolean' ? r.success : result.success;
+      const outputFiles = r.outputFiles ?? r.output_files;
 
       const state: GetCommandOutputState = {
+        durationMs: r.durationMs ?? r.duration_ms,
         error: r.error,
-        newOutput: r.newOutput || r.output,
+        exitCode: r.exitCode ?? r.exit_code,
+        outputFiles,
         running: r.running ?? false,
-        success: result.success,
+        stderr: r.stderr,
+        stdout: r.stdout,
+        success: outputSuccess,
       };
 
       const content = formatCommandOutput({
+        durationMs: r.durationMs ?? r.duration_ms,
         error: r.error,
+        exitCode: r.exitCode ?? r.exit_code,
         output: r.newOutput || r.output,
-        running: r.running ?? false,
-        success: result.success,
+        outputFiles,
+        stderr: r.stderr,
+        stdout: r.stdout,
+        success: outputSuccess,
       });
 
       return { content, state, success: true };
@@ -377,16 +422,19 @@ export abstract class ComputerRuntime {
         });
       }
 
+      const killSuccess =
+        typeof result.result?.success === 'boolean' ? result.result.success : result.success;
+
       const state: KillCommandState = {
         commandId: args.commandId,
         error: result.result?.error,
-        success: result.success,
+        success: killSuccess,
       };
 
       const content = formatKillResult({
         error: result.result?.error,
         shellId: args.commandId,
-        success: result.success,
+        success: killSuccess,
       });
 
       return { content, state, success: true };
@@ -429,7 +477,14 @@ export abstract class ComputerRuntime {
 
   async globFiles(args: GlobFilesParams): Promise<BuiltinServerRuntimeOutput> {
     try {
-      const result = await this.callService('globLocalFiles', args);
+      const requestedLimit =
+        Number.isFinite(args.limit) && args.limit && args.limit > 0
+          ? Math.floor(args.limit)
+          : MAX_AGENT_GLOB_RESULTS;
+      const result = await this.callService('globLocalFiles', {
+        ...args,
+        limit: Math.min(requestedLimit, MAX_AGENT_GLOB_RESULTS),
+      });
 
       if (!result.success) {
         return this.errorOutput(result, {
@@ -464,8 +519,25 @@ export abstract class ComputerRuntime {
   }
 
   private errorOutput(result: ServiceResult, state: any): BuiltinServerRuntimeOutput {
+    // Defensive fallback: when a service reports success: false without an
+    // error object, JSON.stringify(undefined) returns the value `undefined`
+    // (not the string "undefined"), which collapsed downstream into an empty
+    // tool-message content while pluginState still got persisted.
+    //
+    // Priority chain:
+    //   1. result.error.message (explicit error from service layer)
+    //   2. JSON.stringify(result.error) (non-Error error objects)
+    //   3. state.stderr (e.g. git commit failure — exit ≠ 0, error in stderr)
+    //   4. state.error (runtime-level error message)
+    //   5. [UNKNOWN_EXEC_ERROR] Tool execution failed (last-resort fallback)
+    const errorText =
+      result.error?.message ||
+      (result.error !== undefined ? JSON.stringify(result.error) : undefined) ||
+      (typeof state?.stderr === 'string' ? state.stderr : undefined) ||
+      (typeof state?.error === 'string' ? state.error : undefined) ||
+      '[UNKNOWN_EXEC_ERROR] Tool execution failed';
     return {
-      content: result.error?.message || JSON.stringify(result.error),
+      content: errorText,
       state,
       success: true,
     };

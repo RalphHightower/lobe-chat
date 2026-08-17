@@ -4,17 +4,23 @@ import { memo, useMemo } from 'react';
 
 import { type ActionKeys } from '@/features/ChatInput';
 import { ChatInput } from '@/features/Conversation';
+import { contextSelectors, useConversationStore } from '@/features/Conversation/store';
 import { useModelSupportImageOutput } from '@/hooks/useModelSupportImageOutput';
 import { useAgentStore } from '@/store/agent';
-import { agentSelectors } from '@/store/agent/selectors';
+import { agentByIdSelectors } from '@/store/agent/selectors';
 import { useChatStore } from '@/store/chat';
 import { useUserStore } from '@/store/user';
 import { userGeneralSettingsSelectors } from '@/store/user/selectors';
 
+import AgentConfigError from './AgentConfigError';
 import { useSendMenuItems } from './useSendMenuItems';
 
-const emptyRightActions: ActionKeys[] = [];
-const promptTransformRightActions: ActionKeys[] = ['promptTransform'];
+const contextWindowRightActions: ActionKeys[] = ['voiceMessage', 'contextWindow'];
+const promptTransformRightActions: ActionKeys[] = [
+  'promptTransform',
+  'voiceMessage',
+  'contextWindow',
+];
 
 /**
  * MainChatInput
@@ -28,38 +34,36 @@ const MainChatInput = memo(() => {
   const isDevMode = useUserStore((s) => userGeneralSettingsSelectors.config(s).isDevMode);
   const sendMenuItems = useSendMenuItems();
 
-  const model = useAgentStore(agentSelectors.currentAgentModel);
-  const provider = useAgentStore(agentSelectors.currentAgentModelProvider);
+  const agentId = useConversationStore(contextSelectors.agentId);
+  const model = useAgentStore(agentByIdSelectors.getAgentModelById(agentId));
+  const provider = useAgentStore(agentByIdSelectors.getAgentModelProviderById(agentId));
+  const isAgentConfigLoading = useAgentStore(agentByIdSelectors.isAgentConfigLoadingById(agentId));
   const supportsImageOutput = useModelSupportImageOutput(model, provider);
-  const rightActions = supportsImageOutput ? promptTransformRightActions : emptyRightActions;
+  const rightActions = supportsImageOutput
+    ? promptTransformRightActions
+    : contextWindowRightActions;
 
-  const leftActions: ActionKeys[] = useMemo(
-    () => [
-      'model',
-      'search',
-      'memory',
-      'fileUpload',
-      'tools',
-      'typo',
-      ...(isDevMode ? (['params'] as ActionKeys[]) : []),
-      'mainToken',
-    ],
-    [isDevMode],
-  );
+  // Reasoning effort lives inside the "+" menu (Plus → 推理强度) rather than as
+  // a standalone action — per the effort parameter refactoring.
+  const leftActions: ActionKeys[] = useMemo(() => ['model', 'plus'], []);
 
   return (
-    <ChatInput
-      skipScrollMarginWithList
-      leftActions={leftActions}
-      rightActions={rightActions}
-      {...(isDevMode
-        ? { sendMenu: { items: sendMenuItems } }
-        : { sendButtonProps: { shape: 'round' } })}
-      onEditorReady={(instance) => {
-        // Sync to global ChatStore for compatibility with other features
-        useChatStore.setState({ mainInputEditor: instance });
-      }}
-    />
+    <>
+      <AgentConfigError />
+      <ChatInput
+        skipScrollMarginWithList
+        isConfigLoading={isAgentConfigLoading}
+        leftActions={leftActions}
+        rightActions={rightActions}
+        {...(isDevMode
+          ? { sendMenu: { items: sendMenuItems } }
+          : { sendButtonProps: { shape: 'round' } })}
+        onEditorReady={(instance) => {
+          // Sync to global ChatStore for compatibility with other features
+          useChatStore.setState({ mainInputEditor: instance });
+        }}
+      />
+    </>
   );
 });
 

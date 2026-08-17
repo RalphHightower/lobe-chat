@@ -2,12 +2,15 @@
 
 import type { IEditor } from '@lobehub/editor';
 import type { EditorState as LobehubEditorState } from '@lobehub/editor/react';
+import { toast } from '@lobehub/ui/base-ui';
 import isEqual from 'fast-deep-equal';
+import { t } from 'i18next';
 
 import { EMPTY_EDITOR_STATE } from '@/libs/editor/constants';
 import { isValidEditorData } from '@/libs/editor/isValidEditorData';
 import { documentService } from '@/services/document';
 import type { StoreSetter } from '@/store/types';
+import { composeSkillMarkdown, parseSkillMarkdownFrontmatter } from '@/utils/skillMarkdown';
 import { setNamespace } from '@/utils/storeDebug';
 
 import type { DocumentStore } from '../../store';
@@ -43,30 +46,44 @@ export class EditorActionImpl {
     this.#get = get;
   }
 
+  private getPersistedMarkdown = (documentId: string | undefined, markdown: string): string => {
+    if (!documentId) return markdown;
+
+    const doc = this.#get().documents[documentId];
+    if (doc?.contentFormat !== 'skillMarkdown') return markdown;
+
+    return composeSkillMarkdown(doc.skillFrontmatter, markdown);
+  };
+
   getEditorContent = (): { editorData: any; markdown: string } | null => {
-    const { editor } = this.#get();
+    const { activeDocumentId, editor } = this.#get();
     if (!editor) return null;
 
     try {
       const markdown = (editor.getDocument('markdown') as unknown as string) || '';
       const editorData = editor.getDocument('json');
-      return { editorData, markdown };
+      return { editorData, markdown: this.getPersistedMarkdown(activeDocumentId, markdown) };
     } catch (error) {
       console.error('[DocumentStore] Failed to get editor content:', error);
       return null;
     }
   };
 
-  handleContentChange = (): void => {
+  private syncEditorContent = (
+    documentId?: string,
+    options: { triggerAutoSave?: boolean } = {},
+  ): boolean => {
     const { editor, activeDocumentId, documents, internal_dispatchDocument } = this.#get();
+    const id = documentId || activeDocumentId;
 
-    if (!editor || !activeDocumentId) return;
+    if (!editor || !id) return false;
 
-    const doc = documents[activeDocumentId];
-    if (!doc) return;
+    const doc = documents[id];
+    if (!doc) return false;
 
     try {
-      const markdown = (editor.getDocument('markdown') as unknown as string) || '';
+      const editorMarkdown = (editor.getDocument('markdown') as unknown as string) || '';
+      const markdown = this.getPersistedMarkdown(id, editorMarkdown);
       const editorData = editor.getDocument('json');
 
       const markdownChanged = markdown !== doc.lastSavedContent;
@@ -75,7 +92,7 @@ export class EditorActionImpl {
 
       internal_dispatchDocument(
         {
-          id: activeDocumentId,
+          id,
           type: 'updateDocument',
           value: { content: markdown, editorData, isDirty: contentChanged },
         },
@@ -83,11 +100,67 @@ export class EditorActionImpl {
       );
 
       // Only trigger auto-save if content actually changed AND autoSave is enabled
-      if (contentChanged && doc.autoSave !== false) {
-        this.#get().triggerDebouncedSave(activeDocumentId);
+      if (options.triggerAutoSave !== false && contentChanged && doc.autoSave !== false) {
+        this.#get().triggerDebouncedSave(id);
       }
+
+      return contentChanged;
     } catch (error) {
       console.error('[DocumentStore] Failed to update content:', error);
+      return false;
+    }
+  };
+
+  commitEditorMutation = async (
+    documentId?: string,
+    options?: SaveExecutionOptions,
+  ): Promise<void> => {
+    const id = documentId || this.#get().activeDocumentId;
+    if (!id) return;
+
+    this.syncEditorContent(id, { triggerAutoSave: false });
+    await this.performSave(id, undefined, options);
+  };
+
+  handleContentChange = (): void => {
+    this.syncEditorContent(undefined, { triggerAutoSave: true });
+  };
+
+  updateSkillFrontmatter = (documentId: string, frontmatter: string): boolean => {
+    const { activeDocumentId, documents, editor, internal_dispatchDocument } = this.#get();
+    const doc = documents[documentId];
+
+    if (!doc || doc.contentFormat !== 'skillMarkdown') return false;
+
+    try {
+      const isActiveDocument = activeDocumentId === documentId;
+      const body =
+        isActiveDocument && editor
+          ? (editor.getDocument('markdown') as unknown as string) || ''
+          : parseSkillMarkdownFrontmatter(doc.content).body;
+      const editorData = isActiveDocument && editor ? editor.getDocument('json') : doc.editorData;
+      const content = composeSkillMarkdown(frontmatter, body);
+      const contentChanged = content !== doc.lastSavedContent;
+      const editorDataChanged = !isEqual(editorData, doc.lastSavedEditorData);
+
+      internal_dispatchDocument(
+        {
+          id: documentId,
+          type: 'updateDocument',
+          value: {
+            content,
+            editorData,
+            isDirty: contentChanged || editorDataChanged,
+            skillFrontmatter: frontmatter,
+          },
+        },
+        'updateSkillFrontmatter',
+      );
+
+      return true;
+    } catch (error) {
+      console.error('[DocumentStore] Failed to update SKILL.md frontmatter:', error);
+      return false;
     }
   };
 
@@ -111,6 +184,49 @@ export class EditorActionImpl {
     internal_dispatchDocument({ id: documentId, type: 'updateDocument', value: { isDirty: true } });
   };
 
+  /**
+   * Apply a snapshot returned by the server-side page-agent tool executor.
+   * The server has already written `documents.content` / `documents.editorData`,
+   * so this only updates in-memory store state to match: clears the dirty flag,
+   * advances `lastSaved*` and refreshes `lastUpdatedTime`. Editor-level Lexical
+   * application is handled by `EditorRuntime.applyServerSnapshot` upstream.
+   */
+  applyServerSnapshot = (
+    documentId: string,
+    snapshot: {
+      content?: string;
+      editorData?: Record<string, unknown>;
+      title?: string;
+    },
+  ): void => {
+    const { documents, internal_dispatchDocument } = this.#get();
+    const doc = documents[documentId];
+    if (!doc) return;
+
+    const value: Record<string, unknown> = {
+      isDirty: false,
+      lastUpdatedTime: new Date(),
+      saveStatus: 'saved',
+    };
+
+    if (typeof snapshot.content === 'string') {
+      value.content = snapshot.content;
+      value.lastSavedContent = snapshot.content;
+    }
+    if (snapshot.editorData && isValidEditorData(snapshot.editorData)) {
+      value.editorData = structuredClone(snapshot.editorData);
+      value.lastSavedEditorData = structuredClone(snapshot.editorData);
+    }
+    if (typeof snapshot.title === 'string') {
+      value.title = snapshot.title;
+    }
+
+    internal_dispatchDocument(
+      { id: documentId, type: 'updateDocument', value: value as Partial<typeof doc> },
+      n('applyServerSnapshot'),
+    );
+  };
+
   onEditorInit = async (editor: IEditor): Promise<void> => {
     const { activeDocumentId, documents } = this.#get();
     if (!editor || !activeDocumentId) return;
@@ -124,6 +240,31 @@ export class EditorActionImpl {
       doc.editorData &&
       typeof doc.editorData === 'object' &&
       Object.keys(doc.editorData).length > 0;
+
+    // SKILL.md frontmatter is metadata, not editable document body. Keep it out of the rich
+    // Markdown editor because `---` fences are otherwise parsed as Markdown dividers/headings,
+    // then stitch the same YAML back into the persisted content during save.
+    if (doc.contentFormat === 'skillMarkdown') {
+      if (hasValidEditorData) {
+        try {
+          editor.setDocument('json', JSON.stringify(doc.editorData));
+          return;
+        } catch {
+          console.warn(
+            '[DocumentStore] Failed to load SKILL.md editorData, falling back to markdown',
+          );
+        }
+      }
+
+      try {
+        editor.setDocument('markdown', parseSkillMarkdownFrontmatter(doc.content).body);
+        this.#set({ editor });
+      } catch (err) {
+        console.error('[DocumentStore] Failed to load SKILL.md content:', err);
+      }
+
+      return;
+    }
 
     // Set content from document state
     if (hasValidEditorData) {
@@ -171,7 +312,8 @@ export class EditorActionImpl {
     internal_dispatchDocument({ id, type: 'updateDocument', value: { saveStatus: 'saving' } });
 
     try {
-      const currentContent = (editor.getDocument('markdown') as unknown as string) || '';
+      const currentEditorMarkdown = (editor.getDocument('markdown') as unknown as string) || '';
+      const currentContent = this.getPersistedMarkdown(id, currentEditorMarkdown);
       const currentEditorData = editor.getDocument('json');
 
       if (!isValidEditorData(currentEditorData)) {
@@ -187,6 +329,7 @@ export class EditorActionImpl {
         content: currentContent,
         editorData: JSON.stringify(currentEditorData),
         id,
+        lockOwnerId: doc.lockOwnerId,
         metadata: metadata?.emoji ? { emoji: metadata.emoji } : undefined,
         restoreFromHistoryId: options?.restoreFromHistoryId,
         saveSource: options?.saveSource,
@@ -198,23 +341,56 @@ export class EditorActionImpl {
         id,
         type: 'updateDocument',
         value: {
+          content: currentContent,
           editorData: structuredClone(currentEditorData),
 
           isDirty: false,
           lastSavedContent: currentContent,
           lastSavedEditorData: structuredClone(currentEditorData),
           lastUpdatedTime: result.savedAt ? new Date(result.savedAt) : new Date(),
+          saveBlockedByLock: false,
           saveStatus: 'saved',
         },
       });
     } catch (error) {
-      console.error('[DocumentStore] Failed to save:', error);
-      internal_dispatchDocument({ id, type: 'updateDocument', value: { saveStatus: 'idle' } });
+      // The server rejects writes to a workspace document another collaborator is
+      // actively editing (CONFLICT). Surface it as a lock block so the editor can
+      // flip to read-only at once instead of silently dropping the edit, and keep
+      // `isDirty` so the unsaved content stays visible to copy out.
+      const errorCode = (error as { data?: { code?: string } })?.data?.code;
+      const lockBlocked = errorCode === 'CONFLICT';
+      // A view-level workspace member has no edit right on this document
+      // (FORBIDDEN). Tell the user instead of silently dropping the edit.
+      if (errorCode === 'FORBIDDEN') {
+        toast.error(t('permission.saveNoEditPermission', { ns: 'setting' }));
+      }
+      if (!lockBlocked) console.error('[DocumentStore] Failed to save:', error);
+      internal_dispatchDocument({
+        id,
+        type: 'updateDocument',
+        value: { saveBlockedByLock: lockBlocked || undefined, saveStatus: 'idle' },
+      });
     }
   };
 
   setEditorState = (editorState: LobehubEditorState | undefined): void => {
     this.#set({ editorState }, false, n('setEditorState'));
+  };
+
+  /**
+   * Clear the "save rejected by another member's lock" flag.
+   *
+   * `saveBlockedByLock` is set on a CONFLICT save and otherwise only cleared by a
+   * *successful* save — but a blocked editor is read-only, so it can never reach
+   * that success path on its own. Once the lock is no longer held by someone else
+   * (we hold it, or it's free), the block is stale and must be dropped, or the
+   * user stays stuck read-only behind a banner naming the current holder (which
+   * may now be themselves). Called by the lock driver on that transition.
+   */
+  clearSaveBlockedByLock = (id: string): void => {
+    const { documents, internal_dispatchDocument } = this.#get();
+    if (!documents[id]?.saveBlockedByLock) return;
+    internal_dispatchDocument({ id, type: 'updateDocument', value: { saveBlockedByLock: false } });
   };
 }
 

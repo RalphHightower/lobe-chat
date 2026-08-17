@@ -8,10 +8,8 @@ export const styles = createStaticStyles(({ css, cssVar }) => ({
     }
   `,
   actionBtnPrimary: css`
-    &.ant-btn {
-      width: auto !important;
-      padding-inline: 12px !important;
-    }
+    width: auto !important;
+    padding-inline: 12px !important;
   `,
   expandLink: css`
     border: 1px solid ${cssVar.colorFillTertiary} !important;
@@ -23,14 +21,16 @@ export const styles = createStaticStyles(({ css, cssVar }) => ({
     color: ${cssVar.colorTextQuaternary};
   `,
   card: css`
-    .brief-comment-btn {
+    .brief-comment-btn,
+    .brief-view-run-btn {
       opacity: 0;
     }
 
     &:hover {
       border-color: ${cssVar.colorBorder} !important;
 
-      .brief-comment-btn {
+      .brief-comment-btn,
+      .brief-view-run-btn {
         opacity: 1;
       }
     }

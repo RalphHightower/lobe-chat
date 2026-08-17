@@ -12,6 +12,7 @@ vi.mock('zustand/traditional');
 
 // Mock agentService
 vi.mock('@/services/agent', () => ({
+  AVAILABLE_AGENTS_CONTEXT_QUERY_LIMIT: 12,
   agentService: {
     createAgentFiles: vi.fn(),
     createAgentKnowledgeBase: vi.fn(),
@@ -288,7 +289,7 @@ describe('KnowledgeSlice Actions', () => {
 
       await waitFor(() => expect(result.current.data).toEqual(mockData));
 
-      expect(agentService.getFilesAndKnowledgeBases).toHaveBeenCalledWith('agent-1');
+      expect(agentService.getFilesAndKnowledgeBases).toHaveBeenCalledWith('agent-1', undefined);
     });
 
     it('should return empty array as fallback', async () => {

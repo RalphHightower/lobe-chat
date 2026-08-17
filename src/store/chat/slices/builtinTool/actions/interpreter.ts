@@ -10,8 +10,8 @@ import pMap from 'p-map';
 import { type SWRResponse } from 'swr';
 
 import { useClientDataSWR } from '@/libs/swr';
+import { chatToolKeys } from '@/libs/swr/keys';
 import { fileService } from '@/services/file';
-import { pythonService } from '@/services/python';
 import { dbMessageSelectors } from '@/store/chat/selectors';
 import { type ChatStore } from '@/store/chat/store';
 import { useFileStore } from '@/store/file';
@@ -20,8 +20,6 @@ import { setNamespace } from '@/utils/storeDebug';
 
 const n = setNamespace('codeInterpreter');
 const log = debug('lobe-store:builtin-tool');
-
-const SWR_FETCH_INTERPRETER_FILE_KEY = 'FetchCodeInterpreterFileItem';
 
 type Setter = StoreSetter<ChatStore>;
 export const codeInterpreterSlice = (set: Setter, get: () => ChatStore, _api?: unknown) =>
@@ -69,6 +67,8 @@ export class ChatCodeInterpreterActionImpl {
       const files: File[] = [];
       for (const message of dbMessageSelectors.dbUserMessages(this.#get())) {
         for (const file of message.fileList ?? []) {
+          // Tombstoned attachment (viewer lost access) — no url to download.
+          if (file.inaccessible) continue;
           const blob = await fetch(file.url).then((res) => res.blob());
           files.push(new File([blob], file.name));
         }
@@ -91,12 +91,16 @@ export class ChatCodeInterpreterActionImpl {
         }
       }
 
+      // Imported here rather than at module scope: this slice is assembled into the
+      // chat store, so a static import puts Pyodide and Comlink in the bundle every
+      // chat page loads, for a tool most sessions never invoke.
+      const { pythonService } = await import('@/services/python');
       const result = await pythonService.runPython(params.code, params.packages, files);
 
       // Complete interpreter operation
       this.#get().completeOperation(interpreterOpId);
 
-      if (result?.files) {
+      if (result.files) {
         await this.#get().optimisticUpdateMessageContent(
           id,
           JSON.stringify(result),
@@ -189,7 +193,7 @@ export class ChatCodeInterpreterActionImpl {
   };
 
   useFetchInterpreterFileItem = (id?: string): SWRResponse => {
-    return useClientDataSWR(id ? [SWR_FETCH_INTERPRETER_FILE_KEY, id] : null, async () => {
+    return useClientDataSWR(id ? chatToolKeys.interpreterFile(id) : null, async () => {
       if (!id) return null;
 
       const item = await fileService.getFile(id);

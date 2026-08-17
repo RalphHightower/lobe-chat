@@ -12,11 +12,17 @@ export interface ActivateSkillParams {
   name: string;
 }
 
+export type ActivateSkillSource = 'agent' | 'builtin' | 'device' | 'project' | 'user';
+
 export interface ActivateSkillState {
   description?: string;
   hasResources: boolean;
   id: string;
   name: string;
+  /** Skill origin — drives the inspector label (e.g. "Activate Agent Skill"). */
+  source?: ActivateSkillSource;
+  /** Friendly title for UI display; falls back to `name` when unset. */
+  title?: string;
 }
 
 /**
@@ -24,7 +30,8 @@ export interface ActivateSkillState {
  */
 export interface ExecScriptActivatedSkill {
   description?: string;
-  id: string;
+  /** DB skill id; absent for filesystem/builtin activations — match by `name`. */
+  id?: string;
   name: string;
 }
 
@@ -40,7 +47,18 @@ export interface ExecScriptParams {
 
 export interface ExecScriptState {
   command: string;
-  exitCode: number;
+  executionEnv?: 'device' | 'sandbox';
+  /**
+   * Undefined means the command was still running when the observation window
+   * elapsed — mirrors `CommandResult.exitCode`.
+   */
+  exitCode?: number;
+  outputFiles?: CommandResult['outputFiles'];
+  /**
+   * Shell handle for a still-running command, pollable via
+   * `local-system.getCommandOutput`.
+   */
+  shellId?: string;
   success: boolean;
 }
 
@@ -50,8 +68,31 @@ export interface RunCommandOptions {
 }
 
 export interface CommandResult {
-  exitCode: number;
+  /**
+   * Where the command actually ran. Flows into the tool call's plugin state so
+   * execution-target degradation is observable in the product UI.
+   */
+  executionEnv?: 'device' | 'sandbox';
+  /**
+   * Undefined means the command was still running when the observation window
+   * elapsed — the formatter reports it as still running instead of completed.
+   */
+  exitCode?: number;
   output: string;
+  /**
+   * Saved-output file handles reported by the shell when stdout/stderr exceed
+   * the inline preview (device runs save the full stream to disk) — the only
+   * retrieval path for output the preview truncated.
+   */
+  outputFiles?: {
+    stderr?: { path: string; size?: number; truncated?: boolean };
+    stdout?: { path: string; size?: number; truncated?: boolean };
+  };
+  /**
+   * Shell handle for a still-running command, pollable via
+   * `local-system.getCommandOutput`.
+   */
+  shellId?: string;
   stderr?: string;
   success: boolean;
 }

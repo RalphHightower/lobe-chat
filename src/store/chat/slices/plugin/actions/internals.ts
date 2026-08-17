@@ -5,7 +5,7 @@ import { type ChatToolPayload, type MessageToolCall, type ToolManifest } from '@
 import { type ChatStore } from '@/store/chat/store';
 import { useToolStore } from '@/store/tool';
 import {
-  klavisStoreSelectors,
+  composioStoreSelectors,
   lobehubSkillStoreSelectors,
   pluginSelectors,
 } from '@/store/tool/selectors';
@@ -27,7 +27,10 @@ export class PluginInternalsActionImpl {
     void get;
   }
 
-  internal_transformToolCalls = (toolCalls: MessageToolCall[]): ChatToolPayload[] => {
+  internal_transformToolCalls = (
+    toolCalls: MessageToolCall[],
+    offeredToolNames?: string[],
+  ): ChatToolPayload[] => {
     const toolNameResolver = new ToolNameResolver();
 
     // Build manifests map from tool store
@@ -35,7 +38,7 @@ export class PluginInternalsActionImpl {
     const manifests: Record<string, ToolManifest> = {};
 
     // Track source for each identifier
-    const sourceMap: Record<string, 'builtin' | 'mcp' | 'klavis' | 'lobehubSkill'> = {};
+    const sourceMap: Record<string, 'builtin' | 'mcp' | 'composio' | 'lobehubSkill'> = {};
 
     // Get all installed plugins (all treated as MCP now)
     const installedPlugins = pluginSelectors.installedPlugins(toolStoreState);
@@ -54,12 +57,12 @@ export class PluginInternalsActionImpl {
       }
     }
 
-    // Get all Klavis tools
-    const klavisTools = klavisStoreSelectors.klavisAsLobeTools(toolStoreState);
-    for (const tool of klavisTools) {
+    // Get all Composio tools
+    const composioTools = composioStoreSelectors.composioAsLobeTools(toolStoreState);
+    for (const tool of composioTools) {
       if (tool.manifest) {
         manifests[tool.identifier] = tool.manifest as ToolManifest;
-        sourceMap[tool.identifier] = 'klavis';
+        sourceMap[tool.identifier] = 'composio';
       }
     }
 
@@ -73,7 +76,7 @@ export class PluginInternalsActionImpl {
     }
 
     // Resolve tool calls and add source field
-    const resolved = toolNameResolver.resolve(toolCalls, manifests);
+    const resolved = toolNameResolver.resolve(toolCalls, manifests, offeredToolNames);
 
     return resolved.map((payload) => {
       // Parse and repair arguments if needed

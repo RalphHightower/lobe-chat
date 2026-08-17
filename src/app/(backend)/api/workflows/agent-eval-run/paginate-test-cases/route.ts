@@ -1,3 +1,4 @@
+import { withOtelMetricsForUpstashWorkflows } from '@lobechat/observability-otel/modules/upstash-workflow';
 import { serve } from '@upstash/workflow/nextjs';
 import debug from 'debug';
 import { chunk } from 'es-toolkit/compat';
@@ -9,6 +10,8 @@ import {
   AgentEvalRunWorkflow,
   type PaginateTestCasesPayload,
 } from '@/server/workflows/agentEvalRun';
+import { resolveAgentEvalRunWorkspace } from '@/server/workflows/agentEvalRun/utils';
+import { runStep } from '@/server/workflows/step';
 
 const CHUNK_SIZE = 20; // Max items to process directly
 const PAGE_SIZE = 50; // Items per page
@@ -19,7 +22,7 @@ const log = debug('lobe-server:workflows:paginate-test-cases');
  * Paginate test cases workflow - handles pagination, filtering, and fanout
  */
 export const { POST } = serve<PaginateTestCasesPayload>(
-  async (context) => {
+  withOtelMetricsForUpstashWorkflows(async (context) => {
     const { runId, cursor, testCaseIds: payloadTestCaseIds, userId } = context.requestPayload ?? {};
 
     log(
@@ -34,6 +37,7 @@ export const { POST } = serve<PaginateTestCasesPayload>(
     }
 
     const db = await getServerDB();
+    const wsId = await resolveAgentEvalRunWorkspace(db, runId);
 
     // If specific testCaseIds are provided (from fanout), process them directly
     if (payloadTestCaseIds && payloadTestCaseIds.length > 0) {
@@ -41,7 +45,7 @@ export const { POST } = serve<PaginateTestCasesPayload>(
 
       await Promise.all(
         payloadTestCaseIds.map((testCaseId) =>
-          context.run(`agent-eval-run:execute:${testCaseId}`, () =>
+          runStep(context, `agent-eval-run:execute:${testCaseId}`, () =>
             AgentEvalRunWorkflow.triggerExecuteTestCase({ runId, testCaseId, userId }),
           ),
         ),
@@ -54,8 +58,8 @@ export const { POST } = serve<PaginateTestCasesPayload>(
     }
 
     // Check if run was aborted before paginating
-    const runStatus = await context.run('agent-eval-run:check-abort', async () => {
-      const runModel = new AgentEvalRunModel(db, userId);
+    const runStatus = await runStep(context, 'agent-eval-run:check-abort', async () => {
+      const runModel = new AgentEvalRunModel(db, userId, wsId);
       const run = await runModel.findById(runId);
       return run?.status;
     });
@@ -66,14 +70,14 @@ export const { POST } = serve<PaginateTestCasesPayload>(
     }
 
     // Paginate through test cases
-    const testCaseBatch = await context.run('agent-eval-run:get-test-cases-page', async () => {
+    const testCaseBatch = await runStep(context, 'agent-eval-run:get-test-cases-page', async () => {
       // Get run to find datasetId and userId
-      const runModel = new AgentEvalRunModel(db, userId);
+      const runModel = new AgentEvalRunModel(db, userId, wsId);
       const run = await runModel.findById(runId);
       if (!run) return { ids: [] };
 
       // Get test cases for this dataset
-      const testCaseModel = new AgentEvalTestCaseModel(db, userId);
+      const testCaseModel = new AgentEvalTestCaseModel(db, userId, wsId);
       const allTestCases = await testCaseModel.findByDatasetId(run.datasetId);
 
       // Apply cursor-based pagination
@@ -103,11 +107,12 @@ export const { POST } = serve<PaginateTestCasesPayload>(
     }
 
     // Filter test cases that need execution
-    const testCaseIds = await context.run('agent-eval-run:filter-existing', () =>
+    const testCaseIds = await runStep(context, 'agent-eval-run:filter-existing', () =>
       AgentEvalRunWorkflow.filterTestCasesNeedingExecution(db, {
         runId,
         testCaseIds: batchTestCaseIds,
         userId,
+        workspaceId: wsId,
       }),
     );
 
@@ -126,7 +131,7 @@ export const { POST } = serve<PaginateTestCasesPayload>(
 
         await Promise.all(
           chunks.map((ids, idx) =>
-            context.run(`agent-eval-run:fanout:${idx + 1}/${chunks.length}`, () =>
+            runStep(context, `agent-eval-run:fanout:${idx + 1}/${chunks.length}`, () =>
               AgentEvalRunWorkflow.triggerPaginateTestCases({ runId, testCaseIds: ids, userId }),
             ),
           ),
@@ -137,7 +142,7 @@ export const { POST } = serve<PaginateTestCasesPayload>(
 
         await Promise.all(
           testCaseIds.map((testCaseId) =>
-            context.run(`agent-eval-run:execute:${testCaseId}`, () =>
+            runStep(context, `agent-eval-run:execute:${testCaseId}`, () =>
               AgentEvalRunWorkflow.triggerExecuteTestCase({ runId, testCaseId, userId }),
             ),
           ),
@@ -148,7 +153,7 @@ export const { POST } = serve<PaginateTestCasesPayload>(
     // Schedule next page
     if (nextCursor) {
       log('Scheduling next page with cursor %s', nextCursor);
-      await context.run('agent-eval-run:next-page', () =>
+      await runStep(context, 'agent-eval-run:next-page', () =>
         AgentEvalRunWorkflow.triggerPaginateTestCases({ cursor: nextCursor, runId, userId }),
       );
     } else {
@@ -161,7 +166,7 @@ export const { POST } = serve<PaginateTestCasesPayload>(
       skippedTestCases: batchTestCaseIds.length - testCaseIds.length,
       success: true,
     };
-  },
+  }),
   {
     flowControl: { key: 'agent-eval-run.paginate-test-cases', parallelism: 200, rate: 5 },
     qstashClient,

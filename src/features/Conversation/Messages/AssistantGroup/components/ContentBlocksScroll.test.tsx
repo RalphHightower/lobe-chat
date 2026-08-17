@@ -9,8 +9,10 @@ import ContentBlocksScroll from './ContentBlocksScroll';
 import type { RenderableAssistantContentBlock } from './types';
 
 vi.mock('@lobehub/ui', () => ({
-  Flexbox: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
-  ScrollShadow: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  Flexbox: ({ children, gap }: { children?: ReactNode; gap?: number }) => (
+    <div data-gap={gap}>{children}</div>
+  ),
+  ScrollArea: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
 }));
 
 vi.mock('antd-style', () => ({
@@ -61,5 +63,21 @@ describe('ContentBlocksScroll', () => {
       'data-disable-markdown-streaming',
       'true',
     );
+  });
+
+  it('uses a consistent gap between workflow blocks', () => {
+    const { container } = render(
+      <ContentBlocksScroll
+        assistantId="assistant-1"
+        scroll={false}
+        variant="workflow"
+        blocks={[
+          { content: 'first workflow block', id: 'block-1' },
+          { content: 'second workflow block', id: 'block-2' },
+        ]}
+      />,
+    );
+
+    expect(container.querySelector('[data-gap="8"]')).toBeInTheDocument();
   });
 });

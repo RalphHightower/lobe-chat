@@ -1,8 +1,7 @@
 import querystring from 'node:querystring';
 import { URL } from 'node:url';
 
-import type { DataSyncConfig } from '@lobechat/electron-client-ipc';
-import retry from 'async-retry';
+import type { DataSyncConfig, DesktopBootstrapIdentity } from '@lobechat/electron-client-ipc';
 import { safeStorage, session as electronSession } from 'electron';
 
 import { OFFICIAL_CLOUD_SERVER } from '@/const/env';
@@ -10,6 +9,7 @@ import GatewayConnectionService from '@/services/gatewayConnectionSrv';
 import { appendVercelCookie } from '@/utils/http-headers';
 import { createLogger } from '@/utils/logger';
 import { netFetch } from '@/utils/net-fetch';
+import { setDesktopUserAgentHeader } from '@/utils/user-agent';
 
 import { ControllerModule, IpcMethod } from './index';
 
@@ -93,6 +93,7 @@ export default class RemoteServerConfigCtr extends ControllerModule {
    * @param config Optional config object, if not provided will fetch current config
    * @returns true if remote server is properly configured
    */
+  @IpcMethod()
   async isRemoteServerConfigured(config?: DataSyncConfig): Promise<boolean> {
     const effectiveConfig = config ?? (await this.getRemoteServerConfig());
     const isActive = Boolean(effectiveConfig.active);
@@ -179,6 +180,37 @@ export default class RemoteServerConfigCtr extends ControllerModule {
    * Used to control refresh frequency on app startup/activate
    */
   private lastRefreshAt?: number;
+
+  /**
+   * Resolve the cache-partition identity synchronously for the renderer preload.
+   * This deliberately avoids `getUserState()`: the encrypted OIDC token already
+   * contains the stable subject required for local isolation.
+   */
+  getDesktopBootstrapIdentity(): DesktopBootstrapIdentity {
+    if (!this.encryptedAccessToken) this.loadTokensFromStore();
+
+    if (!this.encryptedAccessToken) return { isIdentityResolved: true };
+
+    try {
+      const accessToken = safeStorage.isEncryptionAvailable()
+        ? safeStorage.decryptString(Buffer.from(this.encryptedAccessToken, 'base64'))
+        : this.encryptedAccessToken;
+      const parts = accessToken.split('.');
+      if (parts.length !== 3) return { isIdentityResolved: false };
+
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as {
+        sub?: unknown;
+      };
+      if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
+        return { isIdentityResolved: false };
+      }
+
+      return { isIdentityResolved: true, userId: payload.sub };
+    } catch (error) {
+      logger.warn('Failed to resolve Desktop bootstrap identity from access token:', error);
+      return { isIdentityResolved: false };
+    }
+  }
 
   /**
    * Promise representing the ongoing token refresh operation.
@@ -378,10 +410,8 @@ export default class RemoteServerConfigCtr extends ControllerModule {
   }
 
   /**
-   * Refresh access token with retry mechanism
-   * Use stored refresh token to obtain a new access token
-   * Handles concurrent requests by returning the existing refresh promise if one is in progress.
-   * Retries up to 3 times with exponential backoff for transient errors.
+   * Refresh the access token using the stored refresh token (single attempt).
+   * Concurrent callers share the in-progress refresh promise.
    */
   async refreshAccessToken(): Promise<{ error?: string; success: boolean }> {
     // If a refresh is already in progress, return the existing promise
@@ -390,60 +420,18 @@ export default class RemoteServerConfigCtr extends ControllerModule {
       return this.refreshPromise;
     }
 
-    // Start a new refresh operation with retry
-    logger.info('Initiating new token refresh operation with retry.');
-    this.refreshPromise = this.performTokenRefreshWithRetry();
+    logger.info('Initiating new token refresh operation.');
 
-    // Return the promise so callers can wait
-    return this.refreshPromise;
-  }
-
-  /**
-   * Performs token refresh with retry mechanism
-   * Uses exponential backoff: 1s, 2s, 4s
-   */
-  private async performTokenRefreshWithRetry(): Promise<{ error?: string; success: boolean }> {
-    try {
-      return await retry(
-        async (bail, attemptNumber) => {
-          logger.debug(`Token refresh attempt ${attemptNumber}/3`);
-
-          const result = await this.performTokenRefresh();
-
-          if (result.success) {
-            return result;
-          }
-
-          // Check if error is non-retryable
-          if (this.isNonRetryableError(result.error)) {
-            logger.warn(`Non-retryable error encountered: ${result.error}`);
-            // Use bail to stop retrying immediately
-            bail(new Error(result.error));
-            return result; // This won't be reached, but TypeScript needs it
-          }
-
-          // Throw error to trigger retry for transient errors
-          throw new Error(result.error);
-        },
-        {
-          factor: 2, // Exponential backoff factor
-          maxTimeout: 4000, // Max wait time between retries: 4s
-          minTimeout: 1000, // Min wait time between retries: 1s
-          onRetry: (err: Error, attempt: number) => {
-            logger.info(`Token refresh retry ${attempt}/3: ${err.message}`);
-          },
-          retries: 3, // Total retry attempts
-        },
-      );
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('Token refresh failed after all retries:', errorMessage);
-      return { error: errorMessage, success: false };
-    } finally {
-      // Ensure the promise reference is cleared once the operation completes
+    // No retry: with refresh token rotation the server consumes the old token as soon
+    // as the request lands. Resending it (e.g. after a lost response) triggers reuse
+    // detection — invalid_grant + revocation of the whole grant — which logs the user
+    // out. Transient failures are recovered by the next refresh cycle instead.
+    this.refreshPromise = this.performTokenRefresh().finally(() => {
       logger.debug('Clearing the refresh promise reference.');
       this.refreshPromise = null;
-    }
+    });
+
+    return this.refreshPromise;
   }
 
   /**
@@ -486,6 +474,7 @@ export default class RemoteServerConfigCtr extends ControllerModule {
         'Content-Type': 'application/x-www-form-urlencoded',
       };
       appendVercelCookie(headers);
+      setDesktopUserAgentHeader(headers);
       const response = await netFetch(tokenUrl.toString(), { body, headers, method: 'POST' });
 
       if (!response.ok) {
@@ -592,6 +581,7 @@ export default class RemoteServerConfigCtr extends ControllerModule {
           requestHeaders['Oidc-Auth'] = token;
           logger.debug(`Injected Oidc-Auth token for: ${details.url}`);
         }
+        setDesktopUserAgentHeader(requestHeaders);
 
         callback({ requestHeaders });
       },

@@ -4,11 +4,17 @@ import {
   InvokeModelCommand,
   InvokeModelWithResponseStreamCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import { cloudModelIdMapping } from '@lobechat/business-const';
 import { ModelProvider } from 'model-bank';
 
+import type { AnthropicGenerateObjectResponse } from '../../core/anthropicCompatibleFactory/generateObject';
+import {
+  buildAnthropicGenerateObjectRequest,
+  emitAnthropicGenerateObjectUsage,
+  parseAnthropicGenerateObjectResponse,
+} from '../../core/anthropicCompatibleFactory/generateObject';
 import { resolveCacheTTL } from '../../core/anthropicCompatibleFactory/resolveCacheTTL';
 import { resolveMaxTokens } from '../../core/anthropicCompatibleFactory/resolveMaxTokens';
+import { resolveClaudeThinkingConfig } from '../../core/anthropicCompatibleFactory/resolveThinkingConfig';
 import type { LobeRuntimeAI } from '../../core/BaseAI';
 import { buildAnthropicMessages, buildAnthropicTools } from '../../core/contextBuilders/anthropic';
 import { resolveModelSamplingParameters } from '../../core/parameterResolver';
@@ -17,19 +23,24 @@ import {
   AWSBedrockLlamaStream,
   createBedrockStream,
 } from '../../core/streams';
+import { ErrorClassifier } from '../../errors';
 import type {
   ChatMethodOptions,
   ChatStreamPayload,
   Embeddings,
   EmbeddingsOptions,
   EmbeddingsPayload,
+  GenerateObjectOptions,
+  GenerateObjectPayload,
 } from '../../types';
 import { AgentRuntimeErrorType } from '../../types/error';
 import { AgentRuntimeError } from '../../utils/createError';
 import { debugStream } from '../../utils/debugStream';
 import { getModelPricing } from '../../utils/getModelPricing';
-import { isExceededContextWindowError } from '../../utils/isExceededContextWindowError';
 import { StreamingResponse } from '../../utils/response';
+import { stripUnsupportedClaudeAssistantPrefill } from '../anthropic/claudePrefill';
+import { normalizeClaudeThinkingHistoryMessages } from '../anthropic/claudeThinkingHistory';
+import { rejectsDisabledThinkingAtEffort } from '../anthropic/modelId';
 
 /**
  * A prompt constructor for HuggingFace LLama 2 chat models.
@@ -66,7 +77,9 @@ export function experimental_buildLlama2Prompt(messages: { content: string; role
 export interface LobeBedrockAIParams {
   accessKeyId?: string;
   accessKeySecret?: string;
+  apiKey?: string;
   id?: string;
+  modelIdMapping?: Record<string, string>;
   region?: string;
   sessionToken?: string;
 }
@@ -74,16 +87,37 @@ export interface LobeBedrockAIParams {
 export class LobeBedrockAI implements LobeRuntimeAI {
   private client: BedrockRuntimeClient;
   private id: string;
+  private modelIdMapping: Record<string, string>;
 
   region: string;
 
   constructor(options: LobeBedrockAIParams = {}) {
-    const { id, region, accessKeyId, accessKeySecret, sessionToken } = options;
+    const {
+      id,
+      modelIdMapping = {},
+      region,
+      accessKeyId,
+      accessKeySecret,
+      apiKey,
+      sessionToken,
+    } = options;
+
+    this.region = region ?? 'us-east-1';
+    this.id = id ?? ModelProvider.Bedrock;
+    this.modelIdMapping = modelIdMapping;
+
+    if (apiKey) {
+      this.client = new BedrockRuntimeClient({
+        authSchemePreference: ['httpBearerAuth'],
+        region: this.region,
+        token: { token: apiKey },
+      });
+      return;
+    }
 
     if (!(accessKeyId && accessKeySecret))
       throw AgentRuntimeError.createError(AgentRuntimeErrorType.InvalidBedrockCredentials);
-    this.region = region ?? 'us-east-1';
-    this.id = id ?? ModelProvider.Bedrock;
+
     this.client = new BedrockRuntimeClient({
       credentials: {
         accessKeyId,
@@ -98,6 +132,10 @@ export class LobeBedrockAI implements LobeRuntimeAI {
     if (payload.model.startsWith('meta')) return this.invokeLlamaModel(payload, options);
 
     return this.invokeClaudeModel(payload, options);
+  }
+
+  private resolveModelId(model: string): string {
+    return this.modelIdMapping[model] ?? model;
   }
   /**
    * Supports the Amazon Titan Text models series.
@@ -121,6 +159,73 @@ export class LobeBedrockAI implements LobeRuntimeAI {
     );
     return Promise.all(promises);
   }
+
+  async generateObject(payload: GenerateObjectPayload, options?: GenerateObjectOptions) {
+    return this.invokeClaudeGenerateObject(payload, options);
+  }
+
+  private invokeClaudeGenerateObject = async (
+    payload: GenerateObjectPayload,
+    options?: GenerateObjectOptions,
+  ) => {
+    const { bedrock: bedrockModels } = await import('model-bank');
+    const resolvedMaxTokens = await resolveMaxTokens({
+      model: payload.model,
+      providerModels: bedrockModels,
+      thinking: payload.thinking,
+    });
+    const systemMessages = payload.messages.filter((m) => m.role === 'system');
+    const normalizedMessages = normalizeClaudeThinkingHistoryMessages(
+      payload.messages.filter((m) => m.role !== 'system') as ChatStreamPayload['messages'],
+    ) as GenerateObjectPayload['messages'];
+    const { requestParams, schemaToolName } = await buildAnthropicGenerateObjectRequest(
+      { ...payload, messages: [...systemMessages, ...normalizedMessages] },
+      // requestModel keys the prefill guard on the Bedrock id actually sent
+      // below, so channel modelIdMapping aliases still get the strip.
+      { maxTokens: resolvedMaxTokens, requestModel: this.resolveModelId(payload.model) },
+    );
+    const bedrockRequestParams: Omit<Anthropic.MessageCreateParams, 'model'> & {
+      model?: Anthropic.MessageCreateParams['model'];
+    } = { ...requestParams };
+    delete bedrockRequestParams.model;
+
+    const command = new InvokeModelCommand({
+      accept: 'application/json',
+      body: JSON.stringify({
+        anthropic_version: 'bedrock-2023-05-31',
+        ...bedrockRequestParams,
+      }),
+      contentType: 'application/json',
+      modelId: this.resolveModelId(payload.model),
+    });
+
+    try {
+      const [res, pricing] = await Promise.all([
+        this.client.send(command, { abortSignal: options?.signal }),
+        getModelPricing(payload.model, this.id, options?.pricingContext),
+      ]);
+      const responseBody = JSON.parse(
+        new TextDecoder().decode(res.body),
+      ) as AnthropicGenerateObjectResponse;
+
+      await emitAnthropicGenerateObjectUsage(responseBody, options, pricing);
+
+      return parseAnthropicGenerateObjectResponse(responseBody, schemaToolName);
+    } catch (e) {
+      const err = e as Error & { $metadata: any };
+
+      throw AgentRuntimeError.chat({
+        error: {
+          body: err.$metadata,
+          message: err.message,
+          type: err.name,
+        },
+        errorType: AgentRuntimeErrorType.ProviderBizError,
+        provider: this.id,
+        region: this.region,
+      });
+    }
+  };
 
   private invokeEmbeddingModel = async (
     payload: EmbeddingsPayload,
@@ -172,7 +277,9 @@ export class LobeBedrockAI implements LobeRuntimeAI {
     } = payload;
     const inputStartAt = Date.now();
     const system_message = messages.find((m) => m.role === 'system');
-    const user_messages = messages.filter((m) => m.role !== 'system');
+    const user_messages = normalizeClaudeThinkingHistoryMessages(
+      messages.filter((m) => m.role !== 'system'),
+    );
     // Filter out empty/whitespace-only system prompts — Anthropic API rejects them
     const systemPromptText =
       typeof system_message?.content === 'string' && system_message.content.trim()
@@ -202,12 +309,13 @@ export class LobeBedrockAI implements LobeRuntimeAI {
       enabledContextCaching,
     });
 
-    const postMessages = await buildAnthropicMessages(user_messages, { enabledContextCaching });
-
-    // Claude 4.6 models do not support assistant turn prefill
-    if (model.includes('-4-6') && postMessages.at(-1)?.role === 'assistant') {
-      postMessages.pop();
-    }
+    // Key the prefill guard on the resolved Bedrock model id: a custom logical
+    // id can map to a Claude 4.6+/5 Bedrock id via the channel modelIdMapping,
+    // which would otherwise skip the strip and 400 on a trailing assistant turn.
+    const postMessages = stripUnsupportedClaudeAssistantPrefill(
+      this.resolveModelId(model),
+      await buildAnthropicMessages(user_messages, { enabledContextCaching }),
+    );
 
     const anthropicBase = {
       anthropic_version: 'bedrock-2023-05-31',
@@ -219,18 +327,16 @@ export class LobeBedrockAI implements LobeRuntimeAI {
 
     let anthropicPayload;
 
-    if (!!thinking && (thinking.type === 'enabled' || thinking.type === 'adaptive')) {
-      const resolvedThinking =
-        thinking.type === 'enabled'
-          ? {
-              budget_tokens: Math.min(thinking?.budget_tokens || 1024, resolvedMaxTokens - 1),
-              type: 'enabled' as const,
-            }
-          : { type: 'adaptive' as const };
+    const resolvedThinking = resolveClaudeThinkingConfig({
+      maxTokens: resolvedMaxTokens,
+      model,
+      thinking,
+    });
 
+    if (resolvedThinking && resolvedThinking.type !== 'disabled') {
       anthropicPayload = {
         ...anthropicBase,
-        ...(thinking.type === 'adaptive' && effort ? { output_config: { effort } } : {}),
+        ...(resolvedThinking.type === 'adaptive' && effort ? { output_config: { effort } } : {}),
         thinking: resolvedThinking,
       };
     } else {
@@ -242,8 +348,16 @@ export class LobeBedrockAI implements LobeRuntimeAI {
         { normalizeTemperature: true, preferTemperature: true },
       );
 
+      // Claude Opus 5 and later reject disabled thinking at effort `xhigh` / `max`; every lower
+      // effort level stays valid, so only that pairing is dropped.
+      const forwardsEffort =
+        !!effort &&
+        !(resolvedThinking?.type === 'disabled' && rejectsDisabledThinkingAtEffort(model, effort));
+
       anthropicPayload = {
         ...anthropicBase,
+        ...(forwardsEffort ? { output_config: { effort } } : {}),
+        ...(resolvedThinking ? { thinking: resolvedThinking } : {}),
         temperature: resolvedSamplingParams.temperature,
         top_p: resolvedSamplingParams.top_p,
       };
@@ -253,7 +367,7 @@ export class LobeBedrockAI implements LobeRuntimeAI {
       accept: 'application/json',
       body: JSON.stringify(anthropicPayload),
       contentType: 'application/json',
-      modelId: cloudModelIdMapping[model] || model,
+      modelId: this.resolveModelId(model),
     });
 
     try {
@@ -268,7 +382,7 @@ export class LobeBedrockAI implements LobeRuntimeAI {
         debugStream(debug).catch(console.error);
       }
 
-      const pricing = await getModelPricing(payload.model, this.id);
+      const pricing = await getModelPricing(payload.model, this.id, options?.pricingContext);
       const cacheTTL = resolveCacheTTL({ ...payload, enabledContextCaching }, anthropicBase);
       const pricingOptions = cacheTTL ? { lookupParams: { ttl: cacheTTL } } : undefined;
 
@@ -285,7 +399,7 @@ export class LobeBedrockAI implements LobeRuntimeAI {
       );
     } catch (e) {
       const err = e as Error & { $metadata: any };
-      const errorType = isExceededContextWindowError(err.message)
+      const errorType = ErrorClassifier.isExceededContextWindow(err.message)
         ? AgentRuntimeErrorType.ExceededContextWindow
         : AgentRuntimeErrorType.ProviderBizError;
 

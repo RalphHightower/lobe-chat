@@ -1,18 +1,17 @@
 'use client';
 
+import { copyToClipboard, Flexbox, Popover, Skeleton, Text, usePopoverContext } from '@lobehub/ui';
+import { Button, Checkbox, confirmModal, Select, toast } from '@lobehub/ui/base-ui';
+import { Divider } from 'antd';
 import {
-  Button,
-  Checkbox,
-  copyToClipboard,
-  Flexbox,
-  Popover,
-  Skeleton,
-  Text,
-  usePopoverContext,
-} from '@lobehub/ui';
-import { Select } from '@lobehub/ui/base-ui';
-import { App, Divider } from 'antd';
-import { ExternalLinkIcon, LinkIcon, LockIcon } from 'lucide-react';
+  FileOutputIcon,
+  ImageIcon,
+  KeyRoundIcon,
+  LinkIcon,
+  LockIcon,
+  PaperclipIcon,
+  WrenchIcon,
+} from 'lucide-react';
 import { type ReactNode } from 'react';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -20,6 +19,8 @@ import useSWR from 'swr';
 
 import { useAppOrigin } from '@/hooks/useAppOrigin';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { usePermission } from '@/hooks/usePermission';
+import { shareKeys } from '@/libs/swr/keys';
 import { topicService } from '@/services/topic';
 import { useChatStore } from '@/store/chat';
 import { useGlobalStore } from '@/store/global';
@@ -29,19 +30,29 @@ import { styles } from './style';
 
 type Visibility = 'private' | 'link';
 
+const PRIVACY_WARNING_ITEMS = [
+  { icon: WrenchIcon, labelKey: 'shareModal.popover.privacyWarning.items.toolCalls' },
+  { icon: KeyRoundIcon, labelKey: 'shareModal.popover.privacyWarning.items.credentials' },
+  { icon: ImageIcon, labelKey: 'shareModal.popover.privacyWarning.items.images' },
+  { icon: PaperclipIcon, labelKey: 'shareModal.popover.privacyWarning.items.files' },
+] as const;
+
 interface SharePopoverContentProps {
   onOpenModal?: () => void;
+  topicId?: string;
 }
 
-const SharePopoverContent = memo<SharePopoverContentProps>(({ onOpenModal }) => {
+const SharePopoverContent = memo<SharePopoverContentProps>(({ onOpenModal, topicId }) => {
   const { t } = useTranslation('chat');
-  const { message, modal } = App.useApp();
+
   const [updating, setUpdating] = useState(false);
   const { close } = usePopoverContext();
   const containerRef = useRef<HTMLDivElement>(null);
   const appOrigin = useAppOrigin();
+  const { allowed: canShare, reason } = usePermission('edit_own_content');
 
-  const activeTopicId = useChatStore((s) => s.activeTopicId);
+  const chatActiveTopicId = useChatStore((s) => s.activeTopicId);
+  const activeTopicId = topicId ?? chatActiveTopicId;
   const [hideTopicSharePrivacyWarning, updateSystemStatus] = useGlobalStore((s) => [
     systemStatusSelectors.systemStatus(s).hideTopicSharePrivacyWarning ?? false,
     s.updateSystemStatus,
@@ -52,17 +63,17 @@ const SharePopoverContent = memo<SharePopoverContentProps>(({ onOpenModal }) => 
     isLoading,
     mutate,
   } = useSWR(
-    activeTopicId ? ['topic-share-info', activeTopicId] : null,
+    activeTopicId && canShare ? shareKeys.topicInfo(activeTopicId) : null,
     () => topicService.getShareInfo(activeTopicId!),
     { revalidateOnFocus: false },
   );
 
   // Auto-create share record if not exists
   useEffect(() => {
-    if (!isLoading && !shareInfo && activeTopicId) {
+    if (!isLoading && !shareInfo && activeTopicId && canShare) {
       topicService.enableSharing(activeTopicId, 'private').then(() => mutate());
     }
-  }, [isLoading, shareInfo, activeTopicId, mutate]);
+  }, [isLoading, shareInfo, activeTopicId, canShare, mutate]);
 
   const shareUrl = shareInfo?.id ? `${appOrigin}/share/t/${shareInfo.id}` : '';
   const currentVisibility = (shareInfo?.visibility as Visibility) || 'private';
@@ -75,14 +86,20 @@ const SharePopoverContent = memo<SharePopoverContentProps>(({ onOpenModal }) => 
       try {
         await topicService.updateShareVisibility(activeTopicId, visibility);
         await mutate();
-        message.success(t('shareModal.link.visibilityUpdated'));
+        // Auto-copy the share link the moment link sharing is enabled
+        if (visibility === 'link' && shareUrl) {
+          await copyToClipboard(shareUrl);
+          toast.success(t('shareModal.copyLinkSuccess'));
+        } else {
+          toast.success(t('shareModal.link.visibilityUpdated'));
+        }
       } catch {
-        message.error(t('shareModal.link.updateError'));
+        toast.error(t('shareModal.link.updateError'));
       } finally {
         setUpdating(false);
       }
     },
-    [activeTopicId, mutate, message, t],
+    [activeTopicId, mutate, t, shareUrl],
   );
 
   const handleVisibilityChange = useCallback(
@@ -95,22 +112,28 @@ const SharePopoverContent = memo<SharePopoverContentProps>(({ onOpenModal }) => 
       ) {
         let doNotShowAgain = false;
 
-        modal.confirm({
+        confirmModal({
           cancelText: t('cancel', { ns: 'common' }),
-          centered: true,
           content: (
-            <div>
-              <p>{t('shareModal.popover.privacyWarning.content')}</p>
-              <div style={{ marginTop: 16 }}>
-                <Checkbox
-                  onChange={(v) => {
-                    doNotShowAgain = v;
-                  }}
-                >
-                  {t('shareModal.popover.privacyWarning.doNotShowAgain')}
-                </Checkbox>
-              </div>
-            </div>
+            <Flexbox gap={16}>
+              <Text>{t('shareModal.popover.privacyWarning.content')}</Text>
+              <Flexbox gap={12} paddingBlock={8}>
+                {PRIVACY_WARNING_ITEMS.map(({ icon: ItemIcon, labelKey }) => (
+                  <Flexbox horizontal align="center" gap={8} key={labelKey}>
+                    <ItemIcon size={16} />
+                    <Text>{t(labelKey)}</Text>
+                  </Flexbox>
+                ))}
+              </Flexbox>
+              <Text>{t('shareModal.popover.privacyWarning.note')}</Text>
+              <Checkbox
+                onChange={(v) => {
+                  doNotShowAgain = v;
+                }}
+              >
+                {t('shareModal.popover.privacyWarning.doNotShowAgain')}
+              </Checkbox>
+            </Flexbox>
           ),
           okText: t('shareModal.popover.privacyWarning.confirm'),
           onOk: () => {
@@ -120,32 +143,33 @@ const SharePopoverContent = memo<SharePopoverContentProps>(({ onOpenModal }) => 
             updateVisibility(visibility);
           },
           title: t('shareModal.popover.privacyWarning.title'),
-          type: 'warning',
         });
       } else {
         updateVisibility(visibility);
       }
     },
-    [
-      currentVisibility,
-      hideTopicSharePrivacyWarning,
-      modal,
-      t,
-      updateSystemStatus,
-      updateVisibility,
-    ],
+    [currentVisibility, hideTopicSharePrivacyWarning, t, updateSystemStatus, updateVisibility],
   );
 
   const handleCopyLink = useCallback(async () => {
     if (!shareUrl) return;
     await copyToClipboard(shareUrl);
-    message.success(t('shareModal.copyLinkSuccess'));
-  }, [shareUrl, message, t]);
+    toast.success(t('shareModal.copyLinkSuccess'));
+  }, [shareUrl, t]);
 
   const handleOpenModal = useCallback(() => {
     close();
     onOpenModal?.();
   }, [close, onOpenModal]);
+
+  if (!canShare) {
+    return (
+      <Flexbox className={styles.container} gap={8}>
+        <Text strong>{t('share', { ns: 'common' })}</Text>
+        <Text type="secondary">{reason}</Text>
+      </Flexbox>
+    );
+  }
 
   // Loading state
   if (isLoading || !shareInfo) {
@@ -218,14 +242,8 @@ const SharePopoverContent = memo<SharePopoverContentProps>(({ onOpenModal }) => 
       <Divider style={{ margin: '4px 0' }} />
 
       <Flexbox horizontal align="center" justify="space-between">
-        <Button
-          icon={ExternalLinkIcon}
-          size="small"
-          type="text"
-          variant="text"
-          onClick={handleOpenModal}
-        >
-          {t('shareModal.popover.moreOptions')}
+        <Button icon={FileOutputIcon} size="small" type="text" onClick={handleOpenModal}>
+          {t('shareModal.popover.export')}
         </Button>
         {currentVisibility !== 'private' && (
           <Button icon={LinkIcon} size="small" type="primary" onClick={handleCopyLink}>
@@ -240,15 +258,16 @@ const SharePopoverContent = memo<SharePopoverContentProps>(({ onOpenModal }) => 
 interface SharePopoverProps {
   children?: ReactNode;
   onOpenModal?: () => void;
+  topicId?: string;
 }
 
-const SharePopover = memo<SharePopoverProps>(({ children, onOpenModal }) => {
+const SharePopover = memo<SharePopoverProps>(({ children, onOpenModal, topicId }) => {
   const isMobile = useIsMobile();
 
   return (
     <Popover
       arrow={false}
-      content={<SharePopoverContent onOpenModal={onOpenModal} />}
+      content={<SharePopoverContent topicId={topicId} onOpenModal={onOpenModal} />}
       placement={isMobile ? 'top' : 'bottomRight'}
       trigger={['click']}
       styles={{

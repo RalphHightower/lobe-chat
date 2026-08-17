@@ -1,73 +1,113 @@
-import { Block, ContextMenuTrigger, Flexbox, Text } from '@lobehub/ui';
+import type { TaskStatus } from '@lobechat/types';
+import { Block, ContextMenuTrigger, Flexbox, Icon, Text, Tooltip } from '@lobehub/ui';
+import { cssVar } from 'antd-style';
+import { LockIcon } from 'lucide-react';
 import { memo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
 
+import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
 import { useTaskStore } from '@/store/task';
 import type { TaskListItem } from '@/store/task/slices/list/initialState';
 
-import TaskScheduleConfig from '../AgentTaskDetail/TaskScheduleConfig';
+import { taskDetailPath } from '../shared/taskDetailPath';
 import AssigneeAgentSelector from './AssigneeAgentSelector';
 import AssigneeAvatar from './AssigneeAvatar';
 import { formatTaskItemDate } from './formatTaskItemDate';
-import TaskLatestActivity from './TaskLatestActivity';
 import TaskPriorityTag from './TaskPriorityTag';
 import TaskStatusTag from './TaskStatusTag';
 import TaskSubtaskProgressTag from './TaskSubtaskProgressTag';
 import TaskTriggerTag from './TaskTriggerTag';
 import { useTaskItemContextMenu } from './useTaskItemContextMenu';
 
+export type TaskItemRouteScope = 'agent' | 'global';
+
 interface TaskItemProps {
+  routeScope?: TaskItemRouteScope;
   task: TaskListItem;
   variant?: 'compact' | 'default';
 }
 
-const TASK_STATUS_SET = new Set([
+const FLEX_MIN_WIDTH_0 = { minWidth: 0 };
+
+const TASK_STATUS_SET = new Set<TaskStatus>([
   'backlog',
   'canceled',
   'completed',
   'failed',
   'paused',
   'running',
+  'scheduled',
 ]);
 
-type TaskStatus = 'backlog' | 'canceled' | 'completed' | 'failed' | 'paused' | 'running';
-
 const toTaskStatus = (status: string): TaskStatus =>
-  TASK_STATUS_SET.has(status) ? (status as TaskStatus) : 'backlog';
+  TASK_STATUS_SET.has(status as TaskStatus) ? (status as TaskStatus) : 'backlog';
 
-const AgentTaskItem = memo<TaskItemProps>(({ task, variant = 'default' }) => {
-  const { t } = useTranslation('discover');
+const AgentTaskItem = memo<TaskItemProps>(({ task, routeScope = 'agent', variant = 'default' }) => {
+  const { t, i18n } = useTranslation('common');
+  const { t: tChat } = useTranslation('chat');
   const useFetchTaskDetail = useTaskStore((s) => s.useFetchTaskDetail);
   useFetchTaskDetail(task.identifier);
 
   const taskDetail = useTaskStore((s) => s.taskDetailMap[task.identifier]);
-  const { items: contextMenuItems, onContextMenu: handleContextMenuOpen } =
-    useTaskItemContextMenu(task);
-  const navigate = useNavigate();
+  const { items: contextMenuItems, onContextMenu: handleContextMenuOpen } = useTaskItemContextMenu(
+    task,
+    routeScope,
+  );
+  const navigate = useWorkspaceAwareNavigate();
 
   const time = formatTaskItemDate(task.updatedAt || task.createdAt, {
     formatOtherYear: t('time.formatOtherYear'),
     formatThisYear: t('time.formatThisYear'),
+    locale: i18n.language,
   });
   const status = toTaskStatus(task.status);
   const hasName = Boolean(task.name?.trim());
 
   const handleClick = useCallback(() => {
-    navigate(`/task/${task.identifier}`);
-  }, [navigate, task.identifier]);
+    navigate(
+      taskDetailPath(
+        task.identifier,
+        routeScope === 'agent' ? (task.assigneeAgentId ?? undefined) : undefined,
+      ),
+    );
+  }, [navigate, routeScope, task.assigneeAgentId, task.identifier]);
 
   const handleSubtaskClick = useCallback(
-    (identifier: string) => {
-      navigate(`/task/${identifier}`);
+    (identifier: string, assigneeAgentId?: string) => {
+      navigate(taskDetailPath(identifier, routeScope === 'agent' ? assigneeAgentId : undefined));
     },
-    [navigate],
+    [navigate, routeScope],
   );
+
+  const scheduledBadge =
+    status === 'scheduled' ? (
+      <Block
+        horizontal
+        align={'center'}
+        flex={'none'}
+        height={20}
+        paddingInline={8}
+        style={{ borderRadius: 24 }}
+        variant={'outlined'}
+      >
+        <Text fontSize={12} type={'secondary'}>
+          {tChat('taskDetail.status.scheduled', { defaultValue: 'Scheduled' })}
+        </Text>
+      </Block>
+    ) : null;
+
+  const privacyBadge =
+    task.visibility === 'private' ? (
+      <Tooltip title={tChat('createTask.visibility.helperPrivate', { defaultValue: 'Private' })}>
+        <Icon color={cssVar.colorTextDescription} icon={LockIcon} size={14} />
+      </Tooltip>
+    ) : null;
 
   const titleRow = (
     <Flexbox horizontal align={'center'} gap={8} style={{ minWidth: 0 }}>
       <TaskPriorityTag priority={task.priority} taskIdentifier={task.identifier} />
       <TaskStatusTag status={status} taskIdentifier={task.identifier} />
+      {privacyBadge}
       {hasName ? (
         <>
           <Text style={{ flex: 'none' }} type={'secondary'}>
@@ -82,6 +122,7 @@ const AgentTaskItem = memo<TaskItemProps>(({ task, variant = 'default' }) => {
           {task.identifier}
         </Text>
       )}
+      {scheduledBadge}
       <TaskSubtaskProgressTag
         currentIdentifier={task.identifier}
         subtasks={taskDetail?.subtasks}
@@ -101,23 +142,19 @@ const AgentTaskItem = memo<TaskItemProps>(({ task, variant = 'default' }) => {
   );
 
   const scheduleNode = task.automationMode ? (
-    <TaskScheduleConfig
-      currentInterval={taskDetail?.heartbeat?.interval ?? 0}
-      taskId={task.identifier}
-    >
-      <TaskTriggerTag
-        heartbeatInterval={taskDetail?.heartbeat?.interval}
-        schedulePattern={task.schedulePattern}
-        scheduleTimezone={task.scheduleTimezone}
-      />
-    </TaskScheduleConfig>
+    <TaskTriggerTag
+      automationMode={task.automationMode}
+      heartbeatInterval={taskDetail?.heartbeat?.interval}
+      schedulePattern={task.schedulePattern}
+      scheduleTimezone={task.scheduleTimezone}
+    />
   ) : null;
 
   const timeNode = time ? (
     <Text
       align={'right'}
       fontSize={12}
-      style={{ whiteSpace: 'nowrap', width: variant === 'compact' ? undefined : 76 }}
+      style={{ whiteSpace: 'nowrap', width: variant === 'compact' ? undefined : 48 }}
       type={'secondary'}
     >
       {time}
@@ -139,14 +176,14 @@ const AgentTaskItem = memo<TaskItemProps>(({ task, variant = 'default' }) => {
             <Text ellipsis style={{ minWidth: 0 }} weight={500}>
               {hasName ? task.name : task.identifier}
             </Text>
+            {scheduledBadge}
             <TaskSubtaskProgressTag
               currentIdentifier={task.identifier}
               subtasks={taskDetail?.subtasks}
               onSubtaskClick={handleSubtaskClick}
             />
           </Flexbox>
-          <TaskLatestActivity activities={taskDetail?.activities} />
-          <Flexbox horizontal align={'center'} gap={8}>
+          <Flexbox horizontal align={'center'} gap={8} style={FLEX_MIN_WIDTH_0}>
             <TaskPriorityTag priority={task.priority} taskIdentifier={task.identifier} />
             {scheduleNode}
             {timeNode}
@@ -167,7 +204,6 @@ const AgentTaskItem = memo<TaskItemProps>(({ task, variant = 'default' }) => {
             {timeNode}
           </Flexbox>
         </Flexbox>
-        <TaskLatestActivity activities={taskDetail?.activities} />
       </Block>
     </ContextMenuTrigger>
   );

@@ -2,7 +2,7 @@
 
 import { Flexbox } from '@lobehub/ui';
 import { memo } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams } from 'react-router';
 
 import { useQuery } from '@/hooks/useQuery';
 import { useDiscoverStore } from '@/store/discover';
@@ -49,8 +49,8 @@ const AssistantDetailPage = memo<AssistantDetailPageProps>(({ mobile }) => {
   );
 });
 
-export const MobileDiscoverAssistantDetailPage = memo<{ mobile?: boolean }>(() => {
+export const MobileDiscoverAssistantDetailPage = (_props: { mobile?: boolean }) => {
   return <AssistantDetailPage mobile={true} />;
-});
+};
 
 export default AssistantDetailPage;

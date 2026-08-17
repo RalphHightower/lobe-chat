@@ -114,9 +114,11 @@ async function waitForPageWorkspaceReady(world: CustomWorld): Promise<void> {
       continue;
     }
 
-    // Any of these means the page workspace is ready for interactions
+    // Any of these means the page workspace is ready for interactions.
+    // The new-page button is rendered by `@lobehub/ui` ActionIcon as a
+    // `<div role="button">` rather than a native `<button>`, so match either.
     const readyCandidates = [
-      world.page.locator('button:has(svg.lucide-square-pen)').first(),
+      world.page.locator(':is(button, [role="button"]):has(svg.lucide-square-pen)').first(),
       world.page.locator('input[placeholder*="Search"], input[placeholder*="搜索"]').first(),
       world.page.locator('a[href^="/page/"]').first(),
     ];
@@ -137,7 +139,7 @@ async function clickNewPageButton(world: CustomWorld): Promise<void> {
   await waitForPageWorkspaceReady(world);
 
   const candidates = [
-    world.page.locator('button:has(svg.lucide-square-pen)').first(),
+    world.page.locator(':is(button, [role="button"]):has(svg.lucide-square-pen)').first(),
     world.page
       .locator('svg.lucide-square-pen')
       .first()
@@ -169,7 +171,7 @@ async function clickNewPageButton(world: CustomWorld): Promise<void> {
 Given('用户在 Page 页面', { timeout: 30_000 }, async function (this: CustomWorld) {
   console.log('   📍 Step: 导航到 Page 页面...');
   await this.page.goto('/page');
-  await this.page.waitForLoadState('networkidle', { timeout: 15_000 });
+  await this.page.waitForLoadState('domcontentloaded', { timeout: 15_000 });
   await waitForPageWorkspaceReady(this);
 
   console.log('   ✅ 已进入 Page 页面');
@@ -178,7 +180,7 @@ Given('用户在 Page 页面', { timeout: 30_000 }, async function (this: Custom
 Given('用户在 Page 页面有一个文稿', async function (this: CustomWorld) {
   console.log('   📍 Step: 导航到 Page 页面...');
   await this.page.goto('/page');
-  await this.page.waitForLoadState('networkidle', { timeout: 15_000 });
+  await this.page.waitForLoadState('domcontentloaded', { timeout: 15_000 });
 
   console.log('   📍 Step: 通过 UI 创建新文稿...');
   await clickNewPageButton(this);
@@ -286,7 +288,7 @@ Given('用户在 Page 页面有一个文稿', async function (this: CustomWorld)
 Given('用户在 Page 页面有一个文稿 {string}', async function (this: CustomWorld, title: string) {
   console.log('   📍 Step: 导航到 Page 页面...');
   await this.page.goto('/page');
-  await this.page.waitForLoadState('networkidle', { timeout: 15_000 });
+  await this.page.waitForLoadState('domcontentloaded', { timeout: 15_000 });
 
   console.log('   📍 Step: 通过 UI 创建新文稿...');
   await clickNewPageButton(this);

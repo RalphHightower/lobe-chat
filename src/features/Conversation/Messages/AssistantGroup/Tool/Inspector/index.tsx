@@ -4,6 +4,7 @@ import { getBuiltinInspector } from '@lobechat/builtin-tools/inspectors';
 import type { ToolIntervention } from '@lobechat/types';
 import { safeParseJSON, safeParsePartialJSON } from '@lobechat/utils';
 import { Flexbox } from '@lobehub/ui';
+import { MessageCircleQuestion } from 'lucide-react';
 import { memo } from 'react';
 
 import SafeBoundary from '@/components/ErrorBoundary';
@@ -26,6 +27,8 @@ interface InspectorProps {
    */
   isToolCalling?: boolean;
   result?: { content: string | null; error?: any; state?: any };
+  toolCallId: string;
+  toolCallStartTime?: number;
 }
 
 const Inspectors = memo<InspectorProps>(
@@ -37,6 +40,8 @@ const Inspectors = memo<InspectorProps>(
     intervention,
     isArgumentsStreaming,
     isToolCalling,
+    toolCallId,
+    toolCallStartTime,
   }) => {
     const isPending = intervention?.status === 'pending';
     const isAborted = intervention?.status === 'aborted';
@@ -67,6 +72,11 @@ const Inspectors = memo<InspectorProps>(
       }
     }
 
+    // askUserQuestion (Claude Code and the builtin user-interaction tool share
+    // the apiName) completes as "a question was asked", not "a task succeeded"
+    // — keep the question-mark glyph instead of the generic tick.
+    const statusSuccessIcon = apiName === 'askUserQuestion' ? MessageCircleQuestion : undefined;
+
     // Check for custom inspector renderer
     const CustomInspector = getBuiltinInspector(identifier, apiName);
 
@@ -79,6 +89,7 @@ const Inspectors = memo<InspectorProps>(
             intervention={intervention}
             isToolExecuting={isToolCalling}
             result={result}
+            successIcon={statusSuccessIcon}
             successVariant={statusSuccessVariant}
           />
           <SafeBoundary minHeight={22} resetKeys={[argsStr, result]}>
@@ -91,9 +102,14 @@ const Inspectors = memo<InspectorProps>(
               partialArgs={partialJson}
               pluginState={result?.state}
               result={result}
+              toolCallId={toolCallId}
             />
           </SafeBoundary>
-          <ExecutionTime isExecuting={showExecutionTimer} />
+          <ExecutionTime
+            isExecuting={showExecutionTimer}
+            startTime={toolCallStartTime}
+            timerKey={toolCallId}
+          />
         </Flexbox>
       );
     }
@@ -107,6 +123,7 @@ const Inspectors = memo<InspectorProps>(
           intervention={intervention}
           isToolExecuting={isToolCalling}
           result={result}
+          successIcon={statusSuccessIcon}
           successVariant={statusSuccessVariant}
         />
         <ToolTitle
@@ -117,7 +134,11 @@ const Inspectors = memo<InspectorProps>(
           isLoading={isTitleLoading}
           partialArgs={partialJson || undefined}
         />
-        <ExecutionTime isExecuting={showExecutionTimer} />
+        <ExecutionTime
+          isExecuting={showExecutionTimer}
+          startTime={toolCallStartTime}
+          timerKey={toolCallId}
+        />
       </Flexbox>
     );
   },

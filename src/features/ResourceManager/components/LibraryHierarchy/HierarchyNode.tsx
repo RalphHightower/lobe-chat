@@ -1,13 +1,14 @@
 'use client';
 
 import { CaretDownFilled, LoadingOutlined } from '@ant-design/icons';
-import { ActionIcon, Block, Flexbox, Icon, showContextMenu, stopPropagation } from '@lobehub/ui';
-import { App, Input } from 'antd';
+import { DERIVED_DOCUMENT_SOURCE_TYPE } from '@lobechat/const';
+import { ActionIcon, Block, Flexbox, Icon, stopPropagation } from '@lobehub/ui';
+import { toast } from '@lobehub/ui/base-ui';
+import { Input } from 'antd';
 import { cx } from 'antd-style';
 import { FileText, FolderIcon, FolderOpenIcon } from 'lucide-react';
 import * as m from 'motion/react-m';
 import React, { memo, useCallback, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 
 import FileIcon from '@/components/FileIcon';
 import { PAGE_FILE_TYPE } from '@/features/ResourceManager/constants';
@@ -15,8 +16,10 @@ import {
   getTransparentDragImage,
   useDragActive,
   useSetCurrentDrag,
-} from '@/routes/(main)/resource/features/DndContextWrapper';
-import { useResourceManagerStore } from '@/routes/(main)/resource/features/store';
+} from '@/features/ResourceManager/DndContextWrapper';
+import { useResourceManagerStore } from '@/features/ResourceManager/store';
+import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
+import { showContextMenu } from '@/libs/contextMenu';
 import type { TreeItem } from '@/store/tree';
 import { useTreeStore } from '@/store/tree';
 
@@ -36,8 +39,7 @@ interface HierarchyNodeProps {
 
 export const HierarchyNode = memo<HierarchyNodeProps>(
   ({ item, level = 0, isExpanded, isLoading, onToggle, selectedKey, parentKey }) => {
-    const navigate = useNavigate();
-    const { message } = App.useApp();
+    const navigate = useWorkspaceAwareNavigate();
 
     const [setMode, libraryId] = useResourceManagerStore((s) => [s.setMode, s.libraryId]);
 
@@ -62,7 +64,7 @@ export const HierarchyNode = memo<HierarchyNodeProps>(
       const pageMatch =
         !isPDF &&
         !isOfficeFile &&
-        (item.sourceType === 'document' || item.fileType === PAGE_FILE_TYPE);
+        (item.sourceType === DERIVED_DOCUMENT_SOURCE_TYPE || item.fileType === PAGE_FILE_TYPE);
 
       return {
         emoji: pageMatch ? item.metadata?.emoji : null,
@@ -82,7 +84,7 @@ export const HierarchyNode = memo<HierarchyNodeProps>(
 
     const handleRenameConfirm = useCallback(async () => {
       if (!renamingValue.trim()) {
-        message.error('Folder name cannot be empty');
+        toast.error('Folder name cannot be empty');
         return;
       }
 
@@ -93,13 +95,13 @@ export const HierarchyNode = memo<HierarchyNodeProps>(
 
       try {
         await renameItem(item.id, parentKey, renamingValue.trim());
-        message.success('Renamed successfully');
+        toast.success('Renamed successfully');
         setIsRenaming(false);
       } catch (error) {
         console.error('Rename error:', error);
-        message.error('Rename failed');
+        toast.error('Rename failed');
       }
-    }, [item.id, item.name, parentKey, renamingValue, renameItem, message]);
+    }, [item.id, item.name, parentKey, renamingValue, renameItem]);
 
     const handleRenameCancel = useCallback(() => {
       setIsRenaming(false);
@@ -114,6 +116,8 @@ export const HierarchyNode = memo<HierarchyNodeProps>(
       onRenameStart: item.isFolder ? handleRenameStart : undefined,
       sourceType: item.sourceType,
       url: item.url,
+      userId: item.userId,
+      visibility: item.visibility,
     });
 
     const isDragActive = useDragActive();

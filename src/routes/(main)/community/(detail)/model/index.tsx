@@ -2,7 +2,7 @@
 
 import { Flexbox } from '@lobehub/ui';
 import { memo } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams } from 'react-router';
 
 import { useDiscoverStore } from '@/store/discover';
 
@@ -36,8 +36,8 @@ const ModelDetailPage = memo<ModelDetailPageProps>(({ mobile }) => {
   );
 });
 
-export const MobileModelPage = memo<{ mobile?: boolean }>(() => {
+export const MobileModelPage = (_props: { mobile?: boolean }) => {
   return <ModelDetailPage mobile={true} />;
-});
+};
 
 export default ModelDetailPage;

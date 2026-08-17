@@ -1,21 +1,14 @@
 import type { TaskStatus } from '@lobechat/types';
-import { Icon, Tooltip } from '@lobehub/ui';
-import { Dropdown, type MenuProps } from 'antd';
+import { type DropdownItem, DropdownMenu, Icon, type MenuInfo, Tooltip } from '@lobehub/ui';
 import { createStaticStyles, cssVar } from 'antd-style';
 import type { LucideIcon } from 'lucide-react';
-import {
-  CircleCheck,
-  CircleDashed,
-  CircleDot,
-  CircleSlash,
-  CircleX,
-  HandIcon,
-  Loader2Icon,
-} from 'lucide-react';
+import { Loader2Icon } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { memo, useCallback, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { TASK_STATUS_VISUALS } from '@/components/ExecutionStatus';
+import { usePermission } from '@/hooks/usePermission';
 import { useTaskStore } from '@/store/task';
 
 import { renderMenuExtra } from './menuExtra';
@@ -27,43 +20,16 @@ interface StatusMeta {
   labelKey: string;
 }
 
+// Icons/colors come from the shared execution-status visuals; this map only
+// adds the task-specific labels.
 export const STATUS_META: Record<TaskStatus, StatusMeta> = {
-  backlog: {
-    color: cssVar.colorTextQuaternary,
-    icon: CircleDashed,
-    label: 'Backlog',
-    labelKey: 'status.backlog',
-  },
-  canceled: {
-    color: cssVar.colorTextSecondary,
-    icon: CircleSlash,
-    label: 'Canceled',
-    labelKey: 'status.canceled',
-  },
-  completed: {
-    color: cssVar.colorSuccess,
-    icon: CircleCheck,
-    label: 'Completed',
-    labelKey: 'status.completed',
-  },
-  failed: {
-    color: cssVar.colorError,
-    icon: CircleX,
-    label: 'Failed',
-    labelKey: 'status.failed',
-  },
-  paused: {
-    color: cssVar.colorInfo,
-    icon: HandIcon,
-    label: 'Pending review',
-    labelKey: 'status.paused',
-  },
-  running: {
-    color: cssVar.colorWarning,
-    icon: CircleDot,
-    label: 'Running',
-    labelKey: 'status.running',
-  },
+  backlog: { ...TASK_STATUS_VISUALS.backlog, label: 'Backlog', labelKey: 'status.backlog' },
+  canceled: { ...TASK_STATUS_VISUALS.canceled, label: 'Canceled', labelKey: 'status.canceled' },
+  completed: { ...TASK_STATUS_VISUALS.completed, label: 'Completed', labelKey: 'status.completed' },
+  failed: { ...TASK_STATUS_VISUALS.failed, label: 'Failed', labelKey: 'status.failed' },
+  paused: { ...TASK_STATUS_VISUALS.paused, label: 'Pending review', labelKey: 'status.paused' },
+  running: { ...TASK_STATUS_VISUALS.running, label: 'Running', labelKey: 'status.running' },
+  scheduled: { ...TASK_STATUS_VISUALS.scheduled, label: 'Scheduled', labelKey: 'status.scheduled' },
 };
 
 export const USER_SELECTABLE_STATUSES: TaskStatus[] = [
@@ -84,6 +50,15 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
       filter: brightness(0.85);
     }
   `,
+  triggerDisabled: css`
+    cursor: not-allowed;
+    display: inline-flex;
+    opacity: 0.5;
+
+    &:hover {
+      filter: none;
+    }
+  `,
 }));
 
 interface TaskStatusTagProps {
@@ -98,7 +73,9 @@ interface TaskStatusTagProps {
 const TaskStatusTag = memo<TaskStatusTagProps>(
   ({ children, disableDropdown, onChange, size = 16, status, taskIdentifier }) => {
     const [loading, setLoading] = useState(false);
+    const [open, setOpen] = useState(false);
     const { t } = useTranslation('chat');
+    const { allowed: canEditTask, reason } = usePermission('create_content');
     const updateTaskStatus = useTaskStore((s) => s.updateTaskStatus);
 
     const displayStatus = status ?? 'backlog';
@@ -106,6 +83,7 @@ const TaskStatusTag = memo<TaskStatusTagProps>(
 
     const handleStatusChange = useCallback(
       async (nextStatus: TaskStatus) => {
+        if (!canEditTask) return;
         if (nextStatus === displayStatus) return;
         if (onChange) {
           onChange(nextStatus);
@@ -120,10 +98,29 @@ const TaskStatusTag = memo<TaskStatusTagProps>(
           setLoading(false);
         }
       },
-      [displayStatus, onChange, taskIdentifier, updateTaskStatus],
+      [canEditTask, displayStatus, onChange, taskIdentifier, updateTaskStatus],
     );
 
-    const menuItems = useMemo<MenuProps['items']>(
+    const handleStatusChangeRef = useRef(handleStatusChange);
+    handleStatusChangeRef.current = handleStatusChange;
+
+    useEffect(() => {
+      if (!open) return;
+      const onKeyDown = (event: KeyboardEvent) => {
+        const num = Number.parseInt(event.key, 10);
+        if (Number.isNaN(num)) return;
+        const idx = num - 1;
+        if (idx < 0 || idx >= USER_SELECTABLE_STATUSES.length) return;
+        event.preventDefault();
+        event.stopPropagation();
+        void handleStatusChangeRef.current(USER_SELECTABLE_STATUSES[idx]);
+        setOpen(false);
+      };
+      document.addEventListener('keydown', onKeyDown, true);
+      return () => document.removeEventListener('keydown', onKeyDown, true);
+    }, [open]);
+
+    const menuItems = useMemo<DropdownItem[]>(
       () =>
         USER_SELECTABLE_STATUSES.map((key, index) => {
           const statusMeta = STATUS_META[key];
@@ -133,7 +130,7 @@ const TaskStatusTag = memo<TaskStatusTagProps>(
             icon: <Icon color={statusMeta.color} icon={statusMeta.icon} size={16} />,
             key,
             label: t(`taskDetail.${statusMeta.labelKey}`, { defaultValue: statusMeta.label }),
-            onClick: ({ domEvent }) => {
+            onClick: ({ domEvent }: MenuInfo) => {
               domEvent.stopPropagation();
               void handleStatusChange(key);
             },
@@ -156,16 +153,19 @@ const TaskStatusTag = memo<TaskStatusTagProps>(
 
     if (disableDropdown) return <>{triggerNode}</>;
 
+    if (!canEditTask)
+      return (
+        <Tooltip title={reason}>
+          <span className={styles.triggerDisabled} onClick={(e) => e.stopPropagation()}>
+            {triggerNode}
+          </span>
+        </Tooltip>
+      );
+
     return (
-      <Dropdown
-        trigger={['click']}
-        menu={{
-          items: menuItems,
-          selectedKeys: [displayStatus],
-        }}
-      >
+      <DropdownMenu items={menuItems} open={open} onOpenChange={setOpen}>
         {triggerNode}
-      </Dropdown>
+      </DropdownMenu>
     );
   },
 );

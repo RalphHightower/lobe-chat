@@ -1,10 +1,11 @@
 import { LOBE_DEFAULT_MODEL_LIST, ModelProvider } from 'model-bank';
 import urlJoin from 'url-join';
 
-import { responsesAPIModels } from '../../const/models';
 import { createRouterRuntime } from '../../core/RouterRuntime';
 import type { CreateRouterRuntimeOptions } from '../../core/RouterRuntime/createRuntime';
 import { detectModelProvider, processMultiProviderModelList } from '../../utils/modelParse';
+import { responsesAPIModels } from '../openai/modelId';
+import { resolveProviderRouteModels } from '../utils/resolveProviderRouteModels';
 
 export interface NewAPIModelCard {
   created: number;
@@ -26,59 +27,46 @@ export interface NewAPIPricing {
   supported_endpoint_types?: string[];
 }
 
-/**
- * Detect if running in browser environment
- */
 const isBrowser = () => typeof window !== 'undefined' && typeof document !== 'undefined';
 
-/**
- * Parse a pricing API HTTP response into a `NewAPIPricing[] | null`.
- * Shared between browser and server branches to avoid duplicated logic.
- */
-const parsePricingResponse = async (res: Response): Promise<NewAPIPricing[] | null> => {
-  if (!res.ok) {
-    return null;
-  }
-
-  try {
-    const body = await res.json();
-    return body?.success && body?.data ? (body.data as NewAPIPricing[]) : null;
-  } catch {
-    return null;
-  }
-};
-
-/**
- * Fetch pricing information with CORS bypass for client-side requests
- * In browser environment, use /webapi/proxy to avoid CORS errors
- */
 const fetchPricing = async (
   pricingUrl: string,
   apiKey: string,
+  providerId = ModelProvider.NewAPI,
 ): Promise<NewAPIPricing[] | null> => {
   try {
+    let res: Response;
     if (isBrowser()) {
-      // In browser environment, use the proxy endpoint to avoid CORS
-      // The proxy endpoint expects the URL as the request body
-      const proxyResponse = await fetch('/webapi/proxy', {
-        body: pricingUrl,
-        method: 'POST',
-      });
-
-      return await parsePricingResponse(proxyResponse);
+      res = await fetch(`/webapi/models/${encodeURIComponent(providerId)}/pricing`);
     } else {
-      // In server environment, fetch directly with proper encoding headers
-      const pricingResponse = await fetch(pricingUrl, {
-        headers: {
+      const fetchWithAuth = async (useAuth: boolean) => {
+        const headers: Record<string, string> = {
           Accept: 'application/json; charset=utf-8',
-          Authorization: `Bearer ${apiKey}`,
-        },
-      });
+        };
+        if (useAuth && apiKey) {
+          headers.Authorization = `Bearer ${apiKey}`;
+        }
+        return fetch(pricingUrl, { headers });
+      };
 
-      return await parsePricingResponse(pricingResponse);
+      let usedAuth = true;
+      try {
+        res = await fetchWithAuth(true);
+      } catch {
+        usedAuth = false;
+        res = await fetchWithAuth(false);
+      }
+
+      if (!res.ok && usedAuth) {
+        res = await fetchWithAuth(false);
+      }
     }
-  } catch (error) {
-    console.debug('Failed to fetch NewAPI pricing info:', error);
+
+    if (!res.ok) return null;
+
+    const body = await res.json();
+    return body?.success && body?.data ? (body.data as NewAPIPricing[]) : null;
+  } catch {
     return null;
   }
 };
@@ -91,7 +79,10 @@ export const params = {
     'X-Client': 'LobeHub',
   },
   id: ModelProvider.NewAPI,
-  models: async ({ client: openAIClient }) => {
+  models: async ({ client: openAIClient, options }) => {
+    const providerId =
+      typeof options?.providerId === 'string' ? options.providerId : ModelProvider.NewAPI;
+
     // Get base URL (remove trailing API version paths like /v1, /v1beta, etc.)
     const baseURL = openAIClient.baseURL.replace(/\/v\d+[a-z]*\/?$/, '');
 
@@ -104,7 +95,11 @@ export const params = {
     // Try to get pricing information to enrich model details
     const pricingMap: Map<string, NewAPIPricing> = new Map();
 
-    const pricingList = await fetchPricing(`${baseURL}/api/pricing`, openAIClient.apiKey || '');
+    const pricingList = await fetchPricing(
+      `${baseURL}/api/pricing`,
+      openAIClient.apiKey || '',
+      providerId,
+    );
     if (Array.isArray(pricingList)) {
       pricingList.forEach((pricing) => {
         pricingMap.set(pricing.model_name, pricing);
@@ -194,7 +189,7 @@ export const params = {
 
     return processMultiProviderModelList([...enrichedModelList, ...additionalModels], 'newapi');
   },
-  routers: (options) => {
+  routers: (options, runtimeContext?: { model?: string }) => {
     const userBaseURL = options.baseURL?.replace(/\/v\d+[a-z]*\/?$/, '') || '';
 
     return [
@@ -226,6 +221,19 @@ export const params = {
         options: {
           ...options,
           baseURL: urlJoin(userBaseURL, '/v1'),
+        },
+      },
+      {
+        apiType: 'deepseek',
+        models: resolveProviderRouteModels(
+          'deepseek',
+          LOBE_DEFAULT_MODEL_LIST,
+          runtimeContext?.model,
+        ),
+        options: {
+          ...options,
+          baseURL: urlJoin(userBaseURL, '/v1'),
+          sdkType: 'openai',
         },
       },
       {

@@ -1,3 +1,4 @@
+import { confirmModal, toast } from '@lobehub/ui/base-ui';
 import { type TFunction } from 'i18next';
 import { type ChangeEvent } from 'react';
 import { useCallback } from 'react';
@@ -39,8 +40,7 @@ const useUploadFolder = ({
       const builtInBlockedCount = originalCount - files.length;
 
       if (builtInBlockedCount > 0) {
-        const { message } = await import('antd');
-        message.info(
+        toast.info(
           t('header.actions.builtInBlockList.filtered', {
             ignored: builtInBlockedCount,
             total: originalCount,
@@ -55,16 +55,13 @@ const useUploadFolder = ({
           const gitignoreContent = await readGitignoreContent(gitignoreFile);
           const gitignoreOriginalCount = files.length;
 
-          const { Modal } = await import('antd');
-
-          Modal.confirm({
+          confirmModal({
             cancelText: t('header.actions.gitignore.cancel'),
             content: t('header.actions.gitignore.content', {
               count: gitignoreOriginalCount,
             }),
             okText: t('header.actions.gitignore.apply'),
             onCancel: () => {
-              // Upload without awaiting - let it run in background
               upload(files);
             },
             onOk: async () => {
@@ -72,8 +69,7 @@ const useUploadFolder = ({
               const ignoredCount = gitignoreOriginalCount - filteredFiles.length;
 
               if (ignoredCount > 0) {
-                const { message } = await import('antd');
-                message.info(
+                toast.info(
                   t('header.actions.gitignore.filtered', {
                     ignored: ignoredCount,
                     total: gitignoreOriginalCount,

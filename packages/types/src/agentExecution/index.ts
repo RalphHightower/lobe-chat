@@ -1,18 +1,161 @@
+import type { LobeAgentChatConfig } from '../agent/chatConfig';
+import type { WorkingDirConfig } from '../device';
 import type { TaskDetail, UIChatMessage } from '../message';
 import type { ChatTopic } from '../topic';
+
+export type AgentSignalOperationKind =
+  'memory' | 'nightly-review' | 'self-feedback-intent' | 'self-reflection' | 'skill';
+
+/**
+ * Run-scoped Agent Signal marker stamped onto a background agent operation at
+ * dispatch. It travels on `appContext.agentSignal`, lands in
+ * `state.metadata.agentSignal`, and is read back on the completion path to
+ * project receipts / briefs (the `agent.execution.completed` payload itself only
+ * carries `agentId/operationId/topicId`). Runtime parsing/validation helpers live
+ * server-side in `operationMarker.ts`.
+ */
+export interface AgentSignalOperationMarker {
+  /**
+   * The reviewed user agent a resulting receipt should be attributed to. Needed
+   * when the run executes under a builtin self-iteration slug (whose resolved
+   * operation agentId is the builtin agent, not the user's agent); the
+   * completion projector prefers this over the run's agentId.
+   */
+  agentId?: string;
+  /**
+   * Explicit display anchor for receipts. Write this only when the producer
+   * already knows the exact assistant message that should own the receipt.
+   *
+   * Do not fall back to the triggering user message here. If the backend only
+   * knows the causal source, write `triggerMessageId` and let the conversation
+   * UI resolve the best display anchor from the current message graph.
+   */
+  anchorMessageId?: string;
+  /** Discriminator the completion handler dispatches on. */
+  kind: AgentSignalOperationKind;
+  /** Local review date (YYYY-MM-DD) for nightly review brief/receipt writes. */
+  localDate?: string;
+  /** Review window end (ISO) — lets tools re-derive the evidence digest. */
+  reviewWindowEnd?: string;
+  /** Review window start (ISO). */
+  reviewWindowStart?: string;
+  /** Stable producer source id of the originating signal. */
+  sourceId?: string;
+  /** Topic the run is scoped to. */
+  topicId?: string;
+  /**
+   * Causal message source for the signal. For user-feedback flows this is the
+   * user message that triggered the receipt; it is not necessarily the message
+   * where the receipt should render.
+   */
+  triggerMessageId?: string;
+}
 
 /**
  * Application context for message storage
  */
 export interface ExecAgentAppContext {
+  /**
+   * Agent document row id (`agent_documents.id`) for the document the user is
+   * currently viewing. When supplied, the active document context is built
+   * directly without a `listDocumentsForTopic` reverse lookup, so docs opened
+   * outside the active topic (skills, web docs) still carry `agent_document_id`
+   * for downstream tool calls.
+   */
+  agentDocumentId?: string | null;
+  /**
+   * Run-scoped Agent Signal marker for background self-iteration / memory runs.
+   * Forwarded into the operation so the completion path can project receipts.
+   */
+  agentSignal?: AgentSignalOperationMarker;
+  /**
+   * Agent that owns the conversation when it differs from the agent executing
+   * this run (for example, a single explicit @Agent direct route).
+   */
+  conversationAgentId?: string;
+  /** Optional default assignee candidate for task manager prompts */
+  defaultTaskAssigneeAgentId?: string;
   /** Current document ID for page-scoped conversations */
   documentId?: string | null;
+  /**
+   * When scope is 'agent_builder', the ID of the agent being edited (i.e. the
+   * left-sidebar agent the user opened AgentBuilder for). The AgentBuilder
+   * builtin runs under its own `agentId`; this field carries the *target* so
+   * server-side tool executors update the correct agent rather than the builder
+   * itself.
+   */
+  editingAgentId?: string;
+  /**
+   * When scope is 'group_agent_builder', the ID of the group being edited (the
+   * group whose Profile page the user opened the builder panel on).
+   *
+   * Deliberately NOT `groupId`: that field marks the run as a *group chat* turn
+   * and gets stamped onto the created topic and messages, which would pull the
+   * builder's private side-conversation into the group's message read path
+   * (`MessageModel.query` filters group chats by `messages.groupId`). The
+   * builder conversation stays owned by the builtin builder agent; only the
+   * group-agent-builder tool runtime and its context injector read this field.
+   */
+  editingGroupId?: string;
   /** Group ID for group chat */
   groupId?: string | null;
+  /**
+   * Initial metadata to merge into the topic when a new topic is created for
+   * this execution. Ignored when a topicId is already provided (existing topic).
+   */
+  initialTopicMetadata?: {
+    repos?: string[];
+    workingDirectory?: string;
+    workingDirectoryConfig?: WorkingDirConfig;
+  };
+  /**
+   * Whether this operation runs inside an isolation thread spawned by another
+   * operation on the same topic (callAgent / callSubAgent / group member).
+   *
+   * Such a run is a guest on its parent's topic: it must not claim or clear the
+   * topic's `runningOperation` mark, which is the parent run's gateway reconnect
+   * anchor. Broader than `isSubAgent` on purpose — the `execSubAgent` (callAgent)
+   * path passes `isSubAgent: false` yet is just as much a guest.
+   */
+  isolationThread?: boolean;
+  /**
+   * Whether this operation is an isolated sub-agent execution. Used to disable
+   * recursive sub-agent dispatch.
+   */
+  isSubAgent?: boolean;
+  /**
+   * Orchestration role of the agent for this group run. `'supervisor'` for the
+   * group's coordinating agent (execGroupAgent), `'member'` for delegated members
+   * (execAgentMember). Stamped onto the assistant message's
+   * `metadata.orchestrationRole` so the role snapshot persists for rendering.
+   */
+  orchestrationRole?: 'supervisor' | 'member';
   /** Scope identifier */
   scope?: string | null;
   /** Session ID */
   sessionId?: string;
+  /** Optional assistant message id that anchors the run (e.g. parent for an isolated thread). */
+  sourceMessageId?: string;
+  /**
+   * Live-progress anchor for a `callSubAgent` child, spread onto
+   * `state.metadata.subAgentProgress`.
+   *
+   * The child runs under its own operationId, but the client only ever subscribes
+   * to the PARENT's gateway channel — which stays open across the sub-agent run
+   * because `waiting_for_async_tool` is excluded from `STREAM_END_STATUSES`. So
+   * the child's step loop publishes its running totals onto the parent's channel,
+   * addressed at the placeholder tool message by `toolMessageId`. Without it the
+   * client sees no stats until the completion bridge backfills `pluginState`.
+   */
+  subAgentProgress?: { parentOperationId: string; toolMessageId: string };
+  /**
+   * Suppresses AgentSignal `agent.user.message` re-emission when this run is itself driven by a
+   * background/builtin agent. Required for self-iteration / memory-writer / skill-manager runs to
+   * avoid recursion into the analyzeIntent pipeline.
+   */
+  suppressSignal?: boolean;
+  /** Current task identifier when executing from a task detail surface */
+  taskId?: string | null;
   /** Thread ID for threaded conversations */
   threadId?: string | null;
   /** Topic ID */
@@ -23,6 +166,26 @@ export interface ExecAgentAppContext {
  * Parameters for execAgent - execute a single Agent
  * Either agentId or slug must be provided
  */
+/**
+ * Ids the client already rendered this run's rows under, for the server to
+ * honour verbatim — the gateway counterpart of `sendMessageInServer`'s
+ * `newTopic.id` / `newUserMessage.id` / `newAssistantMessage.id`. Without
+ * them the gateway path mints its own ids and the client's optimistic rows
+ * never converge with the server rows.
+ *
+ * Only meaningful for a fresh send. Resume / regeneration paths must NOT
+ * carry them: replaying an id there would collide with the row the original
+ * send already created.
+ */
+export interface ExecAgentClientIds {
+  /** Id for the assistant placeholder row this run creates. */
+  assistantMessageId?: string;
+  /** Id for the topic when this run creates one (ignored when reusing). */
+  topicId?: string;
+  /** Id for the user message row this run creates. */
+  userMessageId?: string;
+}
+
 export interface ExecAgentParams {
   /** The agent ID to run (either agentId or slug is required) */
   agentId?: string;
@@ -30,13 +193,15 @@ export interface ExecAgentParams {
   appContext?: ExecAgentAppContext;
   /** Whether to auto-start execution after creating operation (default: true) */
   autoStart?: boolean;
+  /** Client-minted ids for the rows this run creates (fresh sends only). */
+  clientIds?: ExecAgentClientIds;
   /**
-   * Runtime of the client initiating this request. Used by the server to
-   * enable `executor: 'client'` tools (e.g. local-system) when the caller
-   * is a desktop Electron client that will receive `tool_execute` events
-   * over the same Agent Gateway WebSocket.
+   * Client IP of the originating request, captured server-side for run
+   * attribution. Propagated into the run's `state.metadata` and downstream
+   * LLM-call metadata for auditing and spend attribution. Never client-passable
+   * input — derived from the request context.
    */
-  clientRuntime?: 'desktop' | 'web';
+  clientIp?: string;
   /** Explicit device ID to bind to the topic and activate for this run */
   deviceId?: string;
   /** Optional existing message IDs to include in context */
@@ -51,14 +216,71 @@ export interface ExecAgentParams {
   fileIds?: string[];
   /** Additional system instructions appended after the agent's own system role */
   instructions?: string;
+  /** Current desktop's device ID; used only when the effective target is `local`. */
+  localDeviceId?: string;
   /** Override the agent's default model */
   model?: string;
+  /**
+   * Parent operation ID when this run is a sub-agent invocation. Forwarded
+   * to `agent_operations.parent_operation_id` so analytics can join the
+   * sub-tree back to its root.
+   */
+  parentOperationId?: string;
   /** The user input/prompt */
   prompt: string;
   /** Override the agent's default provider */
   provider?: string;
+  /**
+   * Existing topic operation this fresh turn atomically supersedes. The server
+   * accepts the handoff only while the topic marker still belongs to this id.
+   */
+  replacesOperationId?: string;
   /** The agent slug to run (either agentId or slug is required) */
   slug?: string;
+  /**
+   * User agent of the originating request, captured server-side for run
+   * attribution. Propagated into the run's `state.metadata` and downstream
+   * LLM-call metadata for auditing and spend attribution. Never client-passable
+   * input — derived from the request context.
+   */
+  userAgent?: string;
+}
+
+/**
+ * Parameters for scheduleAgentRun — defer an agent run to a future time.
+ *
+ * Deliberately a subset of {@link ExecAgentParams}: a deferred run creates the
+ * topic now and replays the request later through `execAgent`, so anything tied
+ * to a live turn (`existingMessageIds`, `parentOperationId`, `autoStart`) has no
+ * meaning here. One-shot only — recurring execution belongs to
+ * `tasks.automationMode = 'schedule'`.
+ */
+export interface ScheduleAgentRunParams {
+  /** The agent ID to run (either agentId or slug is required) */
+  agentId?: string;
+  /** File IDs of already-uploaded attachments to attach when the run fires */
+  fileIds?: string[];
+  /** Group to file the topic under, when scheduling from a group conversation */
+  groupId?: string | null;
+  /** Override the agent's default model */
+  model?: string;
+  /** The user input/prompt, replayed verbatim when the run comes due */
+  prompt: string;
+  /** Override the agent's default provider */
+  provider?: string;
+  /** When to run. UTC ISO-8601 (`…Z`) — see `TopicScheduledRun.runAt`. */
+  runAt: string;
+  /** The agent slug to run (either agentId or slug is required) */
+  slug?: string;
+}
+
+export interface ScheduleAgentRunResult {
+  /** The resolved agent ID */
+  agentId: string;
+  /** Echoes the scheduled time, so callers don't re-derive it */
+  runAt: string;
+  /** The topic created to hold the deferred run (status `scheduled`) */
+  topicId: string;
 }
 
 /**
@@ -172,59 +394,102 @@ export interface ExecGroupAgentResponse {
   userMessageId: string;
 }
 
-// ============ SubAgent Task Execution Types ============
+// ============ SubAgent Execution Types ============
 
 /**
- * Parameters for execSubAgentTask - execute SubAgent task
+ * Parameters for execSubAgent - execute an agent in an isolated thread
  * Supports both Group mode and Single Agent mode
  *
  * - Group mode: pass groupId, Thread will be associated with the Group
  * - Single Agent mode: omit groupId, Thread will only be associated with the Agent
  */
-export interface ExecSubAgentTaskParams {
-  /** The SubAgent ID to execute the task */
+export interface ExecSubAgentParams {
+  /** The agent ID to execute */
   agentId: string;
   /** The Group ID (optional, only for Group mode) */
   groupId?: string;
-  /** Task instruction/prompt for the SubAgent */
+  /** Instruction/prompt for the agent */
   instruction: string;
-  /** The parent message ID (Supervisor's tool call message or task message) */
+  /** The parent message ID that anchors the isolated thread */
   parentMessageId: string;
   /** Parent operation ID for dispatching callAgent hooks */
   parentOperationId?: string;
   /** Timeout in milliseconds (optional) */
   timeout?: number;
-  /** Task title (shown in UI, used as thread title) */
+  /** Thread title shown in UI */
   title?: string;
   /** The Topic ID */
   topicId: string;
 }
 
 /**
- * Result from execSubAgentTask
+ * Parameters for execVirtualSubAgent - execute a `lobe-agent.callSubAgent`
+ * child run.
+ *
+ * Virtual sub-agents are tool-created isolated runs. They are marked with
+ * `appContext.isSubAgent` so the child cannot recursively spawn more
+ * sub-agents, and they install the completion bridge that backfills the
+ * parent's placeholder tool message before resuming the parent operation.
  */
-export interface ExecSubAgentTaskResult {
-  /** The assistant message ID created for this task */
+export interface ExecVirtualSubAgentParams {
+  /** The agent ID to execute */
+  agentId: string;
+  /**
+   * chatConfig overrides (thinking / reasoning-effort extend params) for the
+   * sub-agent run, from the parent agent's `agencyConfig.subagent.chatConfig`.
+   * Merged over the executing agent's own chatConfig, skipping nulled keys.
+   */
+  chatConfig?: Partial<LobeAgentChatConfig> | null;
+  /** The Group ID inherited from the parent operation, when present */
+  groupId?: string;
+  /** Instruction/prompt for the virtual sub-agent */
+  instruction: string;
+  /**
+   * Model the sub-agent should run on, resolved by the spawn site from the
+   * parent agent's `agencyConfig.subagent` (explicit override or the parent's
+   * effective model). Passed explicitly so the execution side never re-reads
+   * the parent config.
+   */
+  model?: string;
+  /** The parent placeholder tool message ID */
+  parentMessageId: string;
+  /** Parent operation ID to bridge and resume on completion */
+  parentOperationId: string;
+  /** Provider for {@link model}. */
+  provider?: string;
+  /** Timeout in milliseconds (optional) */
+  timeout?: number;
+  /** Thread title shown in UI */
+  title?: string;
+  /** The Topic ID */
+  topicId: string;
+}
+
+/**
+ * Result from execSubAgent
+ */
+export interface ExecSubAgentResult {
+  /** The assistant message ID created for this run */
   assistantMessageId: string;
-  /** Error message if task failed to start */
+  /** Error message if execution failed to start */
   error?: string;
   /** Operation ID for tracking execution status */
   operationId: string;
-  /** Whether the task was created successfully */
+  /** Whether the execution was created successfully */
   success: boolean;
-  /** The Thread ID where the task is executed */
+  /** The Thread ID where the execution is isolated */
   threadId: string;
 }
 
 /**
- * @deprecated Use ExecSubAgentTaskParams instead
+ * @deprecated Use ExecSubAgentParams instead
  */
-export type ExecGroupSubAgentTaskParams = ExecSubAgentTaskParams;
+export type ExecGroupSubAgentTaskParams = ExecSubAgentParams;
 
 /**
- * @deprecated Use ExecSubAgentTaskResult instead
+ * @deprecated Use ExecSubAgentResult instead
  */
-export type ExecGroupSubAgentTaskResult = ExecSubAgentTaskResult;
+export type ExecGroupSubAgentTaskResult = ExecSubAgentResult;
 
 /**
  * Current activity for real-time progress display

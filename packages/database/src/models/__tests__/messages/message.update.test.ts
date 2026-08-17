@@ -13,7 +13,9 @@ import {
   messageTranslates,
   messageTTS,
   sessions,
+  topics,
   users,
+  workspaces,
 } from '../../../schemas';
 import type { LobeChatDatabase } from '../../../type';
 import { MessageModel } from '../../message';
@@ -23,7 +25,9 @@ const serverDB: LobeChatDatabase = await getTestDB();
 
 const userId = 'message-update-test';
 const otherUserId = 'message-update-test-other';
+const workspaceId = 'message-update-workspace';
 const messageModel = new MessageModel(serverDB, userId);
+const workspaceMessageModel = new MessageModel(serverDB, otherUserId, workspaceId);
 const embeddingsId = uuid();
 
 beforeEach(async () => {
@@ -32,6 +36,12 @@ beforeEach(async () => {
     await trx.delete(users).where(eq(users.id, userId));
     await trx.delete(users).where(eq(users.id, otherUserId));
     await trx.insert(users).values([{ id: userId }, { id: otherUserId }]);
+    await trx.insert(workspaces).values({
+      id: workspaceId,
+      name: 'Message Workspace',
+      primaryOwnerId: userId,
+      slug: workspaceId,
+    });
 
     await trx.insert(sessions).values([
       // { id: 'session1', userId },
@@ -89,6 +99,32 @@ describe('MessageModel Update Tests', () => {
       // Assert result
       const result = await serverDB.select().from(messages).where(eq(messages.id, '1'));
       expect(result[0].content).toBe('message 1');
+    });
+
+    it('should report success when a row was actually updated', async () => {
+      await serverDB
+        .insert(messages)
+        .values([{ id: '1', userId, role: 'user', content: 'message 1' }]);
+
+      const result = await messageModel.update('1', { content: 'updated message' });
+
+      expect(result).toEqual({ success: true });
+    });
+
+    it('should report failure when no message matches the id', async () => {
+      const result = await messageModel.update('does-not-exist', { content: 'updated message' });
+
+      expect(result).toEqual({ success: false });
+    });
+
+    it('should report failure when the message belongs to another user', async () => {
+      await serverDB
+        .insert(messages)
+        .values([{ id: '1', userId: otherUserId, role: 'user', content: 'message 1' }]);
+
+      const result = await messageModel.update('1', { content: 'updated message' });
+
+      expect(result).toEqual({ success: false });
     });
 
     it('should update message tools', async () => {
@@ -550,6 +586,22 @@ describe('MessageModel Update Tests', () => {
       expect(dbResult[0].content).toBe('updated content');
     });
 
+    it('should report failure when no tool message matches the id', async () => {
+      const result = await messageModel.updateToolMessage('tool-msg-missing', {
+        content: 'updated content',
+      });
+
+      expect(result.success).toBe(false);
+    });
+
+    it('should report failure when a plugin-only patch matches no plugin row', async () => {
+      const result = await messageModel.updateToolMessage('tool-msg-missing', {
+        pluginState: { key: 'value' },
+      });
+
+      expect(result.success).toBe(false);
+    });
+
     it('should update metadata only and merge with existing', async () => {
       await serverDB.insert(messages).values({
         id: 'tool-msg-2',
@@ -601,6 +653,117 @@ describe('MessageModel Update Tests', () => {
         existingState: 'value1',
         newState: 'value2',
       });
+    });
+
+    it('atomically replaces heterogeneous tool state and rejects stale snapshots', async () => {
+      await serverDB.insert(messages).values({
+        content: '',
+        id: 'tool-state-msg',
+        metadata: { preserved: true },
+        role: 'tool',
+        userId,
+      });
+      await serverDB.insert(messagePlugins).values({
+        id: 'tool-state-msg',
+        identifier: 'codex',
+        state: { obsolete: true },
+        toolCallId: 'todo-1',
+        userId,
+      });
+
+      const applied = await messageModel.updateToolMessage('tool-state-msg', {
+        heterogeneousToolState: { operationId: 'op-1', snapshotSeq: 2 },
+        pluginState: { todos: { items: [{ status: 'processing', text: 'Implement' }] } },
+      });
+
+      expect(applied).toEqual({ applied: true, snapshotSeq: 2, success: true });
+      expect(
+        (await serverDB.select().from(messages).where(eq(messages.id, 'tool-state-msg')))[0]
+          .metadata,
+      ).toEqual({
+        heterogeneousToolStateOperationId: 'op-1',
+        heterogeneousToolStateSeq: 2,
+        preserved: true,
+      });
+      expect(
+        (
+          await serverDB
+            .select()
+            .from(messagePlugins)
+            .where(eq(messagePlugins.id, 'tool-state-msg'))
+        )[0].state,
+      ).toEqual({ todos: { items: [{ status: 'processing', text: 'Implement' }] } });
+
+      const stale = await messageModel.updateToolMessage('tool-state-msg', {
+        heterogeneousToolState: { operationId: 'op-1', snapshotSeq: 1 },
+        pluginState: { stale: true },
+      });
+
+      expect(stale).toEqual({ applied: false, snapshotSeq: 2, success: true });
+      expect(
+        (
+          await serverDB
+            .select()
+            .from(messagePlugins)
+            .where(eq(messagePlugins.id, 'tool-state-msg'))
+        )[0].state,
+      ).toEqual({ todos: { items: [{ status: 'processing', text: 'Implement' }] } });
+
+      const nextOperation = await messageModel.updateToolMessage('tool-state-msg', {
+        heterogeneousToolState: { operationId: 'op-2', snapshotSeq: 1 },
+        pluginState: { restarted: true },
+      });
+
+      expect(nextOperation).toEqual({ applied: true, snapshotSeq: 1, success: true });
+      expect(
+        (await serverDB.select().from(messages).where(eq(messages.id, 'tool-state-msg')))[0]
+          .metadata,
+      ).toMatchObject({
+        heterogeneousToolStateOperationId: 'op-2',
+        heterogeneousToolStateSeq: 1,
+      });
+    });
+
+    it('keeps the highest tool-state seq across concurrent writers', async () => {
+      await serverDB.insert(messages).values({
+        content: '',
+        id: 'tool-state-concurrent',
+        role: 'tool',
+        userId,
+      });
+      await serverDB.insert(messagePlugins).values({
+        id: 'tool-state-concurrent',
+        identifier: 'codex',
+        toolCallId: 'todo-concurrent',
+        userId,
+      });
+
+      await Promise.all([
+        messageModel.updateToolMessage('tool-state-concurrent', {
+          heterogeneousToolState: { operationId: 'op-concurrent', snapshotSeq: 2 },
+          pluginState: { version: 2 },
+        }),
+        messageModel.updateToolMessage('tool-state-concurrent', {
+          heterogeneousToolState: { operationId: 'op-concurrent', snapshotSeq: 3 },
+          pluginState: { version: 3 },
+        }),
+      ]);
+
+      const message = (
+        await serverDB.select().from(messages).where(eq(messages.id, 'tool-state-concurrent'))
+      )[0];
+      const plugin = (
+        await serverDB
+          .select()
+          .from(messagePlugins)
+          .where(eq(messagePlugins.id, 'tool-state-concurrent'))
+      )[0];
+
+      expect(message.metadata).toMatchObject({
+        heterogeneousToolStateOperationId: 'op-concurrent',
+        heterogeneousToolStateSeq: 3,
+      });
+      expect(plugin.state).toEqual({ version: 3 });
     });
 
     it('should update pluginError only', async () => {
@@ -735,7 +898,8 @@ describe('MessageModel Update Tests', () => {
         content: 'hacked content',
       });
 
-      expect(result.success).toBe(true);
+      // Ownership filters the row out, so the patch lands nowhere — a lost write.
+      expect(result.success).toBe(false);
 
       // Verify content was NOT updated
       const dbResult = await serverDB
@@ -770,15 +934,13 @@ describe('MessageModel Update Tests', () => {
     });
 
     it('should return success false on error', async () => {
-      // Don't create any message - this should cause the transaction to succeed
-      // but not update anything (which is still success)
+      // The transaction itself succeeds, but the update matches no row. Batched
+      // writers key their retry ledger off `success`, so this must not be true.
       const result = await messageModel.updateToolMessage('non-existent-id', {
         content: 'content',
       });
 
-      // The method returns success: true even for non-existent messages
-      // because the update query doesn't fail, it just doesn't match any rows
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
     });
 
     it('should handle empty params gracefully', async () => {
@@ -947,6 +1109,30 @@ describe('MessageModel Update Tests', () => {
         .where(eq(messages.id, 'msg-other-user'));
 
       expect(dbResult[0].metadata).toEqual({ originalKey: 'originalValue' });
+    });
+
+    it('should update workspace messages even when created by another user', async () => {
+      await serverDB.insert(messages).values({
+        id: 'msg-workspace-metadata',
+        userId,
+        workspaceId,
+        role: 'user',
+        content: 'test message',
+        metadata: { originalKey: 'originalValue' },
+      });
+
+      await workspaceMessageModel.updateMetadata('msg-workspace-metadata', {
+        workspaceKey: 'workspaceValue',
+      });
+
+      const dbResult = await serverDB
+        .select()
+        .from(messages)
+        .where(eq(messages.id, 'msg-workspace-metadata'));
+      expect(dbResult[0].metadata).toEqual({
+        originalKey: 'originalValue',
+        workspaceKey: 'workspaceValue',
+      });
     });
 
     it('should handle complex nested metadata updates', async () => {
@@ -1272,6 +1458,33 @@ describe('MessageModel Update Tests', () => {
       expect(result[0].content).toBe('translated message 1');
     });
 
+    it('should insert workspaceId for workspace translate records', async () => {
+      await serverDB.insert(messages).values({
+        id: 'workspace-translate',
+        userId,
+        workspaceId,
+        role: 'user',
+        content: 'message 1',
+      });
+
+      await workspaceMessageModel.updateTranslate('workspace-translate', {
+        content: 'translated message 1',
+        from: 'en',
+        to: 'zh',
+      });
+
+      const result = await serverDB
+        .select()
+        .from(messageTranslates)
+        .where(eq(messageTranslates.id, 'workspace-translate'));
+
+      expect(result[0]).toMatchObject({
+        id: 'workspace-translate',
+        userId: otherUserId,
+        workspaceId,
+      });
+    });
+
     it('should update the corresponding fields if message exists in messageTranslates table', async () => {
       // Create test data
       await serverDB.transaction(async (trx) => {
@@ -1311,6 +1524,29 @@ describe('MessageModel Update Tests', () => {
 
       expect(result).toHaveLength(1);
       expect(result[0].voice).toBe('voice1');
+    });
+
+    it('should insert workspaceId for workspace TTS records', async () => {
+      await serverDB.insert(messages).values({
+        id: 'workspace-tts',
+        userId,
+        workspaceId,
+        role: 'user',
+        content: 'message 1',
+      });
+
+      await workspaceMessageModel.updateTTS('workspace-tts', {
+        contentMd5: 'md5',
+        file: 'f1',
+        voice: 'voice1',
+      });
+
+      const result = await serverDB
+        .select()
+        .from(messageTTS)
+        .where(eq(messageTTS.id, 'workspace-tts'));
+
+      expect(result[0]).toMatchObject({ id: 'workspace-tts', userId: otherUserId, workspaceId });
     });
 
     it('should update the corresponding fields if message exists in messageTTS table', async () => {
@@ -1372,6 +1608,25 @@ describe('MessageModel Update Tests', () => {
       expect(result.success).toBe(false);
     });
 
+    it('should not attach files to a message the caller cannot see', async () => {
+      // Message belongs to another user in personal mode — invisible to messageModel
+      await serverDB.insert(messages).values({
+        id: 'msg-foreign',
+        userId: otherUserId,
+        role: 'user',
+        content: 'not yours',
+      });
+
+      const result = await messageModel.addFiles('msg-foreign', ['f1']);
+      expect(result.success).toBe(false);
+
+      const messageFiles = await serverDB
+        .select()
+        .from(messagesFiles)
+        .where(eq(messagesFiles.messageId, 'msg-foreign'));
+      expect(messageFiles).toHaveLength(0);
+    });
+
     it('should add multiple files at once', async () => {
       await serverDB
         .insert(files)
@@ -1431,6 +1686,133 @@ describe('MessageModel Update Tests', () => {
         '{"key":"updated"}',
       );
       expect(result.success).toBe(false);
+    });
+  });
+
+  describe('topic usage rollup', () => {
+    beforeEach(async () => {
+      await serverDB.insert(topics).values({ id: 'update-usage-topic', userId });
+    });
+
+    it('recomputes the topic rollup when the update carries metadata.usage', async () => {
+      await serverDB.insert(messages).values({
+        id: 'finalize-msg',
+        model: 'gpt-4o',
+        provider: 'openai',
+        role: 'assistant',
+        topicId: 'update-usage-topic',
+        userId,
+      });
+
+      // assistant finalize: the write that first carries token usage
+      await messageModel.update('finalize-msg', {
+        metadata: {
+          usage: { cost: 0.004, totalInputTokens: 70, totalOutputTokens: 30, totalTokens: 100 },
+        } as any,
+      });
+
+      const [topic] = await serverDB
+        .select()
+        .from(topics)
+        .where(eq(topics.id, 'update-usage-topic'));
+      expect(topic.totalTokens).toBe(100);
+      expect(topic.totalCost).toBeCloseTo(0.004, 6);
+      expect((topic.usage as any).llm.apiCalls).toBe(1);
+    });
+
+    it('does NOT recompute on a content-only update (no metadata.usage)', async () => {
+      // an already-finalized assistant message with usage
+      await serverDB.insert(messages).values({
+        id: 'done-msg',
+        metadata: { usage: { cost: 0.01, totalInputTokens: 10, totalTokens: 20 } },
+        model: 'gpt-4o',
+        provider: 'openai',
+        role: 'assistant',
+        topicId: 'update-usage-topic',
+        userId,
+      });
+      await messageModel.update('done-msg', {
+        metadata: { usage: { cost: 0.01, totalInputTokens: 10, totalTokens: 20 } } as any,
+      });
+      const [seeded] = await serverDB
+        .select()
+        .from(topics)
+        .where(eq(topics.id, 'update-usage-topic'));
+      expect(seeded.totalTokens).toBe(20);
+
+      // a streaming content-only update must not touch the rollup
+      await messageModel.update('done-msg', { content: 'streamed text' });
+
+      const [topic] = await serverDB
+        .select()
+        .from(topics)
+        .where(eq(topics.id, 'update-usage-topic'));
+      expect(topic.totalTokens).toBe(20);
+      expect(topic.totalCost).toBeCloseTo(0.01, 6);
+    });
+  });
+
+  describe('usage column promotion', () => {
+    it('promotes metadata.usage into the dedicated usage column', async () => {
+      await serverDB.insert(messages).values({
+        id: 'promote-msg',
+        role: 'assistant',
+        userId,
+      });
+
+      const usage = { cost: 0.004, totalInputTokens: 70, totalOutputTokens: 30, totalTokens: 100 };
+      await messageModel.update('promote-msg', { metadata: { usage } as any });
+
+      const [row] = await serverDB.select().from(messages).where(eq(messages.id, 'promote-msg'));
+      expect(row.usage).toEqual(usage);
+      expect((row.metadata as any).usage).toBeUndefined();
+    });
+
+    it('prefers a top-level usage over metadata.usage', async () => {
+      await serverDB.insert(messages).values({
+        id: 'prefer-msg',
+        role: 'assistant',
+        userId,
+      });
+
+      const topLevel = { cost: 0.01, totalTokens: 200 };
+      await messageModel.update('prefer-msg', {
+        metadata: { usage: { cost: 0.004, totalTokens: 100 } } as any,
+        usage: topLevel as any,
+      });
+
+      const [row] = await serverDB.select().from(messages).where(eq(messages.id, 'prefer-msg'));
+      expect(row.usage).toEqual(topLevel);
+      expect((row.metadata as any).usage).toBeUndefined();
+    });
+
+    it('writes top-level usage without duplicating it into metadata', async () => {
+      await serverDB.insert(messages).values({
+        id: 'top-only-msg',
+        metadata: { tps: 1 }, // pre-existing non-usage metadata must be preserved
+        role: 'assistant',
+        userId,
+      });
+
+      const usage = { cost: 0.006, totalTokens: 150 };
+      // no metadata payload — only the top-level usage
+      await messageModel.update('top-only-msg', { usage: usage as any });
+
+      const [row] = await serverDB.select().from(messages).where(eq(messages.id, 'top-only-msg'));
+      expect(row.usage).toEqual(usage);
+      expect((row.metadata as any).usage).toBeUndefined();
+      expect((row.metadata as any).tps).toBe(1);
+    });
+
+    it('updateMetadata syncs usage into the usage column', async () => {
+      await serverDB.insert(messages).values({ id: 'meta-msg', role: 'assistant', userId });
+
+      const usage = { cost: 0.002, totalTokens: 60 };
+      await messageModel.updateMetadata('meta-msg', { usage });
+
+      const [row] = await serverDB.select().from(messages).where(eq(messages.id, 'meta-msg'));
+      expect(row.usage).toEqual(usage);
+      expect((row.metadata as any).usage).toBeUndefined();
     });
   });
 });

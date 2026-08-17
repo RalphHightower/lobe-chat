@@ -11,10 +11,8 @@ const styles = createStaticStyles(({ css }) => ({
     margin-inline-end: 4px;
   `,
   text: css`
-    overflow: hidden;
+    padding-block: 1px;
     color: ${cssVar.colorText};
-    text-overflow: ellipsis;
-    white-space: nowrap;
   `,
 }));
 
@@ -23,16 +21,20 @@ interface FilePathDisplayProps {
   isDirectory?: boolean;
 }
 
+export const getFilePathDisplayInfo = (filePath: string) => {
+  if (!filePath) return { displayPath: '', name: '' };
+
+  const { base, dir } = path.parse(filePath);
+  const parentDir = path.basename(dir);
+
+  return {
+    displayPath: parentDir ? `${parentDir}/${base}` : base,
+    name: base,
+  };
+};
+
 export const FilePathDisplay = memo<FilePathDisplayProps>(({ filePath, isDirectory }) => {
-  const { displayPath, name } = useMemo(() => {
-    if (!filePath) return { displayPath: '', name: '' };
-    const { base, dir } = path.parse(filePath);
-    const parentDir = path.basename(dir);
-    return {
-      displayPath: parentDir ? `${parentDir}/${base}` : base,
-      name: base,
-    };
-  }, [filePath]);
+  const { displayPath, name } = useMemo(() => getFilePathDisplayInfo(filePath), [filePath]);
 
   if (!filePath) return null;
 

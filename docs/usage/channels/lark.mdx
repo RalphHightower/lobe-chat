@@ -13,7 +13,7 @@ tags:
 
 # Connect LobeHub to Lark
 
-By connecting a Lark channel to your LobeHub agent, team members can interact with the AI assistant directly in Lark private chats and group conversations.
+By connecting a Lark channel to your LobeHub agent, team members can interact with the AI assistant directly on Lark through private chats and group conversations.
 
 > If you are using the Chinese version (飞书), please refer to the [Feishu setup guide](/docs/usage/channels/feishu).
 
@@ -21,6 +21,15 @@ By connecting a Lark channel to your LobeHub agent, team members can interact wi
 
 - A LobeHub account with an active subscription
 - A Lark account with permissions to create enterprise apps
+
+## Connection Modes
+
+LobeHub supports two connection modes for Lark bots:
+
+- **WebSocket (Recommended)** — Persistent connection using Lark's official long-lived client. Events are delivered in real time; no public webhook URL is required, so this works out of the box even without a publicly reachable server. This is the default mode for new bots.
+- **Webhook** — HTTP callbacks to an Event Subscription URL. Use this mode if you prefer a stateless callback setup or your app already has an Event Subscription URL configured on the Lark Open Platform.
+
+> **Note:** The steps below (Step 4) that configure an **Event Subscription URL** on the Lark Open Platform only apply to **Webhook mode**. Skip them if you are using the default **WebSocket** mode.
 
 ## Step 1: Create a Lark App
 
@@ -103,16 +112,25 @@ By connecting a Lark channel to your LobeHub agent, team members can interact wi
   - **App ID** — The App ID from your Lark app
   - **App Secret** — The App Secret from your Lark app
 
-  > You don't need to fill in **Verification Token** or **Encrypt Key** at this point — you can set them up after configuring the Event Subscription in Step 4.
+  ### Select Connection Mode
 
-  ### Save and Copy the Webhook URL
+  In **Advanced Settings**, choose the **Connection Mode**:
 
-  Click **Save Configuration**. After saving, an **Event Subscription URL** will be displayed. Copy this URL — you will need it in the next step.
+  - **WebSocket** (default) — Recommended for new bots; skip to Step 5.
+  - **Webhook** — For apps with an existing Event Subscription URL on the Lark Open Platform; continue to the next steps.
+
+  > You don't need to fill in **Verification Token** or **Encrypt Key** at this point — you can set them up after configuring the Event Subscription in Step 4 (Webhook mode only).
+
+  ### Save Configuration (Webhook Only)
+
+  Click **Save Configuration**. In **Webhook mode**, an **Event Subscription URL** will be displayed after saving. Copy this URL — you will need it in the next step. In **WebSocket mode**, the bot connects automatically and no URL is generated.
 
   ![](/blog/assets0a25d3ffb02d35f6f28cdfa9da2dccd8.webp)
 </Steps>
 
-## Step 4: Set Up Event Subscription in Lark
+## Step 4: Set Up Event Subscription in Lark (Webhook Only)
+
+> Skip this step if you are using WebSocket mode (default).
 
 <Steps>
   ### Open Event Subscription Settings
@@ -163,7 +181,23 @@ By connecting a Lark channel to your LobeHub agent, team members can interact wi
 
 ## Step 6: Test the Connection
 
-Back in LobeHub's channel settings, click **Test Connection** to verify the credentials. Then find your bot in Lark by searching its name and send it a message to confirm it responds.
+Back in LobeHub's channel settings, click **Test Connection** to verify the credentials. Then find your bot on Lark by searching its name and send it a message to confirm it responds.
+
+## Step 7: Set Your Platform Identity (Recommended)
+
+One optional field under **Advanced Settings** carries a lot of weight in day-to-day use — fill it in once and most surprises go away.
+
+### Your Platform User ID
+
+This is your own Lark `open_id` (the per-app, per-user identifier — **not** the same as your Lark mobile number or email), used by:
+
+- **Pairing approval** — required when **DM Policy** is set to **Pairing**, since `/approve <code>` is the owner's command and the runtime checks the sender against this ID.
+- **AI tools push** — lets the agent reach you proactively (reminders, notifications) by mapping its internal user reference to your Lark account.
+- **Anti-lockout** — auto-trusted by **Allowed Users**, so scoping the bot to teammates won't accidentally lock you out.
+
+To get it: DM the bot once and inspect the inbound event payload — the `open_id` field on the sender is yours. The Lark Developer Portal also exposes a **User ID** lookup that maps mobile/email to `open_id`. Paste it into **Your Platform User ID** in LobeHub's Advanced Settings.
+
+> Lark doesn't expose a single "default server" concept that AI tools can pivot on (the bot operates per-tenant via credentials), so the **Default Server** field is not exposed for Lark channels.
 
 ## Access Policies
 
@@ -177,6 +211,7 @@ A populated **Allowed User IDs** field is a global gate — DMs *and* group `@me
 
 - **Open (default)** — Any tenant member can DM the bot (subject to the global allowlist when set).
 - **Allowlist** — DMs require the sender to be in **Allowed User IDs**. Differs from `Open` only when the list is empty: `Allowlist` then fails closed (no DMs).
+- **Pairing** — Same gate as `Allowlist`, but a non-listed sender receives a one-time pairing code instead of a flat rejection. Approve via `/approve <code>` and the applicant is auto-appended to **Allowed User IDs**. Requires **Your Platform User ID** to be set (the runtime checks the `/approve` sender against it) and a configured Redis backend.
 - **Disabled** — The bot ignores all DMs and only responds to chat-group `@mentions`.
 
 ### Group Policy
@@ -195,17 +230,19 @@ See the [Channels overview](/docs/usage/channels/overview#direct-message-policy)
 | -------------------------- | -------- | ------------------------------------------------------------------------------------------------------ |
 | **App ID**                 | Yes      | Your Lark app's App ID (`cli_xxx`)                                                                     |
 | **App Secret**             | Yes      | Your Lark app's App Secret                                                                             |
+| **Connection Mode**        | No       | `websocket` (default) or `webhook`. Choose based on whether your app can accept a public webhook URL   |
 | **Verification Token**     | No       | Verifies webhook event source (recommended)                                                            |
-| **Encrypt Key**            | No       | Decrypts encrypted event payloads                                                                      |
-| **Event Subscription URL** | —        | Auto-generated after saving; paste into Lark Developer Portal                                          |
+| **Encrypt Key**            | No       | Decrypts encrypted event payloads (Webhook mode only)                                                  |
+| **Event Subscription URL** | —        | Auto-generated after saving in Webhook mode; paste into Lark Developer Portal                          |
 | **Allowed User IDs**       | No       | Comma- or whitespace-separated Lark `open_id` values. Global gate — applies to DMs and group @mentions |
-| **DM Policy**              | No       | `open` (default), `allowlist`, or `disabled` — who is allowed to DM the bot                            |
+| **DM Policy**              | No       | `open` (default), `allowlist`, `pairing`, or `disabled` — who is allowed to DM the bot                 |
 | **Group Policy**           | No       | `open` (default), `allowlist`, or `disabled` — where the bot responds to @mentions                     |
 | **Allowed Channel IDs**    | No       | Comma- or whitespace-separated Lark `chat_id` values. Used when Group Policy is Allowlist              |
 
 ## Troubleshooting
 
-- **Event Subscription URL verification failed:** Ensure you saved the configuration in LobeHub first, and the URL was copied correctly.
+- **Bot not connecting (WebSocket mode):** Verify the App ID and App Secret are correct, and that the bot capability is enabled with the `im.message.receive_v1` event registered.
+- **Event Subscription URL verification failed (Webhook mode):** Ensure you saved the configuration in LobeHub first, and the URL was copied correctly.
 - **Bot not responding:** Verify the app is published and approved, the bot capability is enabled, and the `im.message.receive_v1` event is subscribed.
 - **Bot ignores DMs:** Open **Advanced Settings** in LobeHub and check **DM Policy**. If it is `Disabled`, switch to `Open` or `Allowlist`. If it is `Allowlist`, confirm the sender's `open_id` is listed in **Allowed User IDs**.
 - **Permission errors:** Confirm all required permissions are added and approved in the Developer Portal.

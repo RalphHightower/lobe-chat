@@ -32,9 +32,6 @@ FROM base AS builder
 ARG USE_CN_MIRROR
 ARG NEXT_PUBLIC_BASE_PATH
 ARG NEXT_PUBLIC_SENTRY_DSN
-ARG NEXT_PUBLIC_ANALYTICS_POSTHOG
-ARG NEXT_PUBLIC_POSTHOG_HOST
-ARG NEXT_PUBLIC_POSTHOG_KEY
 ARG NEXT_PUBLIC_ANALYTICS_UMAMI
 ARG NEXT_PUBLIC_UMAMI_SCRIPT_URL
 ARG NEXT_PUBLIC_UMAMI_WEBSITE_ID
@@ -53,11 +50,6 @@ ENV APP_URL="http://app.com" \
 ENV NEXT_PUBLIC_SENTRY_DSN="${NEXT_PUBLIC_SENTRY_DSN}" \
     SENTRY_ORG="" \
     SENTRY_PROJECT=""
-
-# Posthog
-ENV NEXT_PUBLIC_ANALYTICS_POSTHOG="${NEXT_PUBLIC_ANALYTICS_POSTHOG}" \
-    NEXT_PUBLIC_POSTHOG_HOST="${NEXT_PUBLIC_POSTHOG_HOST}" \
-    NEXT_PUBLIC_POSTHOG_KEY="${NEXT_PUBLIC_POSTHOG_KEY}"
 
 # Umami
 ENV NEXT_PUBLIC_ANALYTICS_UMAMI="${NEXT_PUBLIC_ANALYTICS_UMAMI}" \
@@ -89,7 +81,7 @@ RUN set -e && \
     pnpm i && \
     mkdir -p /deps && \
     cd /deps && \
-    pnpm init && \
+    echo '{"name":"deps","private":true}' > package.json && \
     pnpm add pg drizzle-orm
 
 COPY . .
@@ -100,6 +92,9 @@ RUN rm -rf src/app/desktop "src/app/(backend)/trpc/desktop"
 
 # run build standalone for docker version
 RUN npm run build:docker
+
+# Preserve SWC helpers referenced through pnpm virtual-store symlinks by Next.js.
+RUN mkdir -p /runtime-deps && cp -a node_modules/.pnpm/@swc+helpers@* /runtime-deps/
 
 ## Application image, copy all the files for production
 FROM busybox:latest AS app
@@ -112,6 +107,7 @@ COPY --from=builder /app/.next/standalone /app/
 COPY --from=builder /app/.next/static /app/.next/static
 # Copy SPA assets (Vite build output)
 COPY --from=builder /app/public/_spa /app/public/_spa
+COPY --from=builder /app/public/_spa-workbench /app/public/_spa-workbench
 # Copy database migrations
 COPY --from=builder /app/packages/database/migrations /app/migrations
 COPY --from=builder /app/scripts/migrateServerDB/docker.cjs /app/docker.cjs
@@ -120,6 +116,7 @@ COPY --from=builder /app/scripts/migrateServerDB/errorHint.js /app/errorHint.js
 # copy dependencies
 COPY --from=builder /deps/node_modules/.pnpm /app/node_modules/.pnpm
 COPY --from=builder /deps/node_modules/pg /app/node_modules/pg
+COPY --from=builder /runtime-deps/ /app/node_modules/.pnpm/
 COPY --from=builder /deps/node_modules/drizzle-orm /app/node_modules/drizzle-orm
 
 # Copy server launcher and shared scripts
@@ -210,6 +207,14 @@ ENV NEXT_PUBLIC_S3_DOMAIN="" \
     S3_ENABLE_PATH_STYLE="" \
     S3_SET_ACL=""
 
+# Cloud Sandbox
+ENV SANDBOX_PROVIDER="" \
+    ONLYBOXES_BASE_URL="" \
+    ONLYBOXES_JIT_ISSUER="" \
+    ONLYBOXES_JIT_SIGNING_KEY="" \
+    ONLYBOXES_JIT_TTL_SEC="" \
+    ONLYBOXES_LEASE_TTL_SEC=""
+
 # Model Variables
 ENV \
     # AI21
@@ -217,9 +222,9 @@ ENV \
     # Ai360
     AI360_API_KEY="" AI360_MODEL_LIST="" \
     # AiHubMix
-    AIHUBMIX_API_KEY="" AIHUBMIX_MODEL_LIST="" \
+    AIHUBMIX_API_KEY="" AIHUBMIX_MODEL_LIST="" AIHUBMIX_PROXY_URL="" \
     # Anthropic
-    ANTHROPIC_API_KEY="" ANTHROPIC_MODEL_LIST="" ANTHROPIC_PROXY_URL="" \
+    ANTHROPIC_API_KEY="" ANTHROPIC_CLIENT_TIMEOUT="" ANTHROPIC_MODEL_LIST="" ANTHROPIC_PROXY_URL="" \
     # Amazon Bedrock
     ENABLED_AWS_BEDROCK="" AWS_ACCESS_KEY_ID="" AWS_SECRET_ACCESS_KEY="" AWS_REGION="" AWS_BEDROCK_MODEL_LIST="" \
     # Azure OpenAI

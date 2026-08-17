@@ -1,6 +1,6 @@
 ---
 name: agent-tracing
-description: "Agent tracing CLI for inspecting agent execution snapshots. Use when user mentions 'agent-tracing', 'trace', 'snapshot', wants to debug agent execution, inspect LLM calls, view context engine data, or analyze agent steps. Triggers on agent debugging, trace inspection, or execution analysis tasks."
+description: 'Agent tracing CLI for execution snapshots. Use for agent-tracing, traces, snapshots, LLM call inspection, context engine data, agent step analysis, execution debugging, or pulling remote/production traces ("拉线上 tracing") by operation id. Also the first stop for debugging agent tool calls — wrong or missing tool_calls, unexpected tool arguments or results, which tools were available at a step, or why a tool ran where it did.'
 user-invocable: false
 ---
 
@@ -14,7 +14,7 @@ In `NODE_ENV=development`, `AgentRuntimeService.executeStep()` automatically rec
 
 **Data flow**: executeStep loop -> build `StepPresentationData` -> write partial snapshot to disk -> on completion, finalize to `.agent-tracing/{timestamp}_{traceId}.json`
 
-**Context engine capture**: In `RuntimeExecutors.ts`, the `call_llm` executor emits a `context_engine_result` event after `serverMessagesEngine()` processes messages. This event carries the full `contextEngineInput` (DB messages, systemRole, model, knowledge, tools, userMemory, etc.) and the processed `output` messages (the final LLM payload).
+**Context engine capture**: In `RuntimeExecutors.ts`, the `call_llm` executor calls `ctx.tracingContextEngine(input, output)` after `serverMessagesEngine()` processes messages. `AgentRuntimeService.executeStep` buffers the call per step and forwards it to `OperationTraceRecorder.appendStep` as the typed `contextEngine` field. CE flows through this side channel rather than the `events` array so its heavy payload (agentDocuments, systemRole, …) never enters the Redis state pipeline (LOBE-9110).
 
 ## Package Location
 
@@ -41,7 +41,36 @@ packages/agent-tracing/
 - Completed snapshots: `.agent-tracing/{ISO-timestamp}_{traceId-short}.json`
 - Latest symlink: `.agent-tracing/latest.json`
 - In-progress partials: `.agent-tracing/_partial/{operationId}.json`
+- Downloaded remote snapshots: `.agent-tracing/_remote/{operationId}.json`
 - `FileSnapshotStore` resolves from `process.cwd()` — **run CLI from the repo root**
+
+## Remote Traces (Production / Staging)
+
+Server deployments also upload completed snapshots to object storage (zstd-compressed; the key is stored in `agent_operations.trace_s3_key`). `agent-tracing inspect <operationId>` transparently downloads, decompresses, and caches them — no manual S3 access needed.
+
+1. **Find the operation id** from a business id (users usually hand you a topic id):
+
+   ```sql
+   SELECT id, trace_s3_key FROM agent_operations WHERE topic_id = 'tpc_xxx';
+   ```
+
+   `trace_s3_key IS NULL` means no snapshot was recorded; a non-null key can still 404 in storage (retention/TTL).
+
+2. **Configure the base URL** — the bucket's public domain plus the `/agent-traces` prefix — either way:
+
+   - env var: `TRACING_BASE_URL=https://<bucket-public-domain>/agent-traces`
+   - file: `.agent-tracing/.env` in the repo root containing the same `TRACING_BASE_URL=...` line
+
+   The deployment-specific value is private to each deployment and intentionally not recorded in this repo.
+
+3. **Inspect by operation id** — auto-detected by the `op_..._agt_..._tpc_...` shape; the snapshot is cached to `.agent-tracing/_remote/<opId>.json` and every `inspect` flag works the same as for local traces:
+
+   ```bash
+   agent-tracing inspect op_xxx_agt_xxx_tpc_xxx_xxxx    # step tree of a production run
+   agent-tracing inspect op_xxx_agt_xxx_tpc_xxx_xxxx -T # tool injection (enabledToolIds, manifests)
+   ```
+
+Implementation: `packages/agent-tracing/src/store/remote-store.ts` (URL is built from the operation id as `{base}/{agentId}/{topicId}/{opId}.json.zst`).
 
 ## CLI Commands
 
@@ -103,7 +132,55 @@ agent-tracing inspect <partialOperationId> -p
 
 # Clean up stale partial snapshots
 agent-tracing partial clean
+
+# Map the context window composition of every LLM call (cm / map are aliases)
+agent-tracing ctx-map
+agent-tracing ctx-map <operationId|traceId|path.json>
+agent-tracing ctx-map --html            # standalone report under .agent-tracing/_reports/
+agent-tracing ctx-map --html out.html
 ```
+
+## ctx-map — Context Window Composition
+
+`ctx-map` renders one row per `call_llm` step: the messages that call sent to the model, split
+into typed segments (system / injected block / user / reasoning / tool call / tool result) with
+width proportional to tokens, laid against the model's context window.
+
+The second axis is what `ctx-lint` cannot show: each row is diffed against the previous call, so
+the longest identical **message prefix** — the part a provider's prefix cache can reuse — is
+marked, along with the first message that mutated and the tokens re-processed behind it. A small
+injected block carrying a relative timestamp (`1m ago` → `now`) invalidates every token after it,
+which shows up as a break marker early in the row.
+
+Reading a row:
+
+- **Block colors** encode role directly: orange system, green user, blue assistant, gray tool.
+  Assistant reasoning, content, and tool calls use different steps of the same blue scale;
+  framework-injected blocks use a lighter orange than the system prompt. Every value is a step
+  index into a LobeHub scale vendored in `viewer/contextMapScales.ts`, with assignments in
+  `viewer/contextMapPalette.ts`. The HTML report ships both themes and follows the system theme.
+- **Neutral message frames** group segments that belong to the same payload message. Every role
+  uses the same frame color: the outline communicates structure only, while the block fill carries
+  role and subtype semantics. The original framed layout uses padding inside each message and a
+  small track gap between messages, keeping each payload message visually distinct.
+- **Fill** says whether the provider reused it: shaded `▓` (HTML: 60%-opaque hatch) was served
+  from the prefix cache; solid `█` (HTML: flat) was re-processed by the model.
+- **The line under the track** is the cache ledger — a bracket / green band spanning exactly the
+  cached prefix, then the break marker (`▲` in the terminal, a red rule through the track in
+  HTML) at the column where reuse stopped, with the reason and the re-processed tokens.
+
+| Flag            | Short | Description                                                |
+| --------------- | ----- | ---------------------------------------------------------- |
+| `--html [path]` |       | Standalone HTML report (hover a segment for its content)   |
+| `--width <n>`   | `-w`  | Track width in terminal columns                            |
+| `--window <n>`  |       | Override the model context window used as the track        |
+| `--full-window` |       | Always scale to the full window, never to the largest call |
+| `--json`        | `-j`  | Per-call segments + cache stats                            |
+
+The track scales to the context window; when the window dwarfs the payloads (a 50k payload on a
+1M window) it falls back to the largest call so the composition stays readable, and the header
+says which basis is in use. Analysis lives in `analysis/contextMap.ts` and is exported as
+`buildContextMap()` for downstream corpus work.
 
 ## Inspect Flag Reference
 
@@ -112,7 +189,7 @@ agent-tracing partial clean
 | `--step <n>`      | `-s`  | Target a specific step                                                                            | —            |
 | `--messages`      | `-m`  | Messages context (CE input → params → LLM payload)                                                | —            |
 | `--tools`         | `-t`  | Tool calls & results (what agent invoked)                                                         | —            |
-| `--events`        | `-e`  | Raw events (llm_start, llm_result, etc.)                                                          | —            |
+| `--events`        | `-e`  | Raw events (llm\_start, llm\_result, etc.)                                                        | —            |
 | `--context`       | `-c`  | Runtime context & payload (raw)                                                                   | —            |
 | `--system-role`   | `-r`  | Full system role content                                                                          | 0            |
 | `--env`           |       | Environment context                                                                               | 0            |
@@ -168,12 +245,7 @@ interface ExecutionSnapshot {
   startedAt: number;
   completedAt?: number;
   completionReason?:
-    | 'done'
-    | 'error'
-    | 'interrupted'
-    | 'max_steps'
-    | 'cost_limit'
-    | 'waiting_for_human';
+    'done' | 'error' | 'interrupted' | 'max_steps' | 'cost_limit' | 'waiting_for_human';
   totalSteps: number;
   totalTokens: number;
   totalCost: number;
@@ -199,9 +271,10 @@ interface StepSnapshot {
   messages?: any[]; // DB messages before step
   context?: { phase: string; payload?: unknown; stepContext?: unknown };
   events?: Array<{ type: string; [key: string]: unknown }>;
-  // context_engine_result event contains:
-  //   input: full contextEngineInput (messages, systemRole, model, knowledge, tools, userMemory, ...)
-  //   output: processed messages array (final LLM payload)
+  contextEngine?: {
+    input?: unknown; // contextEngineInput minus messages + toolsConfig (reconstructible from baseline)
+    output?: unknown; // processed messages array (final LLM payload)
+  };
 }
 ```
 
@@ -215,6 +288,6 @@ When using `--messages`, the output shows three sections (if context engine data
 
 ## Integration Points
 
-- **Recording**: `src/server/services/agentRuntime/AgentRuntimeService.ts` — in the `executeStep()` method, after building `stepPresentationData`, writes partial snapshot in dev mode
-- **Context engine event**: `src/server/modules/AgentRuntime/RuntimeExecutors.ts` — in `call_llm` executor, after `serverMessagesEngine()` returns, emits `context_engine_result` event
+- **Recording**: `apps/server/src/services/agentRuntime/AgentRuntimeService.ts` — in the `executeStep()` method, after building `stepPresentationData`, writes partial snapshot in dev mode
+- **Context engine capture**: `apps/server/src/modules/AgentRuntime/RuntimeExecutors.ts` — in `call_llm` executor, after `serverMessagesEngine()` returns, calls `ctx.tracingContextEngine(input, output)`. `AgentRuntimeService.executeStep` buffers it per step and passes it to `traceRecorder.appendStep` as the typed `contextEngine` field (kept off the `events` array to stay out of Redis state).
 - **Store**: `FileSnapshotStore` reads/writes to `.agent-tracing/` relative to `process.cwd()`

@@ -3,6 +3,7 @@ import { type SWRResponse } from 'swr';
 import { type PartialDeep } from 'type-fest';
 
 import { useOnlyFetchOnceSWR } from '@/libs/swr';
+import { builtinAgentKeys } from '@/libs/swr/keys';
 import { agentService } from '@/services/agent';
 import { type StoreSetter } from '@/store/types';
 
@@ -39,6 +40,14 @@ export class BuiltinAgentSliceActionImpl {
     const data = await agentService.getBuiltinAgent(slug);
     if (data?.id) {
       this.#get().internal_dispatchAgentMap(data.id, data as PartialDeep<LobeAgentConfig>);
+      // Mirror useInitBuiltinAgent's onSuccess: keep builtinAgentIdMap in sync
+      // so callers can rely on this as a real "ensure" path instead of just a
+      // post-init refresh.
+      this.#set(
+        { builtinAgentIdMap: { ...this.#get().builtinAgentIdMap, [slug]: data.id } },
+        false,
+        `refreshBuiltinAgent/${slug}`,
+      );
     }
   };
 
@@ -47,7 +56,7 @@ export class BuiltinAgentSliceActionImpl {
     context?: UseInitBuiltinAgentContext,
   ): SWRResponse<AgentItem | null> => {
     return useOnlyFetchOnceSWR(
-      context?.isLogin === false ? null : `initBuiltinAgent:${slug}`,
+      context?.isLogin === false ? null : builtinAgentKeys.init(slug),
       async () => {
         const data = await agentService.getBuiltinAgent(slug);
 

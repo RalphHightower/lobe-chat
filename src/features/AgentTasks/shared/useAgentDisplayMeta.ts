@@ -1,4 +1,5 @@
 import { DEFAULT_AVATAR } from '@lobechat/const';
+import { agentDisplayName } from '@lobechat/types';
 import { cssVar } from 'antd-style';
 import { useTranslation } from 'react-i18next';
 
@@ -16,6 +17,10 @@ interface AgentDisplayMeta {
   title: string;
 }
 
+interface UseAgentDisplayMetaOptions {
+  fallbackToDefault?: boolean;
+}
+
 /**
  * Resolves agent display metadata from agent store with sidebar data as fallback.
  * The agent store only contains agents the user has actively visited, so sidebar
@@ -23,6 +28,7 @@ interface AgentDisplayMeta {
  */
 export const useAgentDisplayMeta = (
   agentId: string | null | undefined,
+  { fallbackToDefault = true }: UseAgentDisplayMetaOptions = {},
 ): AgentDisplayMeta | undefined => {
   const { t } = useTranslation(['chat', 'common']);
   const inboxAgentId = useAgentStore(builtinAgentSelectors.inboxAgentId);
@@ -35,14 +41,22 @@ export const useAgentDisplayMeta = (
 
   const isInbox = isInboxAgentId(agentId, inboxAgentId);
   const sidebarAvatar = typeof sidebarAgent?.avatar === 'string' ? sidebarAgent.avatar : undefined;
+  const hasResolvedMeta =
+    isInbox ||
+    !!meta?.avatar ||
+    !!meta?.backgroundColor ||
+    !!agentDisplayName(meta) ||
+    !!sidebarAgent;
+
+  if (!fallbackToDefault && !hasResolvedMeta) return undefined;
 
   return {
     avatar: meta?.avatar || sidebarAvatar || (isInbox ? DEFAULT_INBOX_AVATAR : DEFAULT_AVATAR),
     backgroundColor:
       meta?.backgroundColor || sidebarAgent?.backgroundColor || cssVar.colorBgContainer,
     title:
-      meta?.title?.trim() ||
-      sidebarAgent?.title ||
+      agentDisplayName(meta) ||
+      agentDisplayName(sidebarAgent) ||
       (isInbox ? t('inbox.title', { ns: 'chat' }) : t('defaultSession', { ns: 'common' })),
   };
 };

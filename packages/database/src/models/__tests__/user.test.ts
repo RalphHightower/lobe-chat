@@ -1,5 +1,5 @@
 import type { UserPreference } from '@lobechat/types';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getTestDB } from '../../core/getTestDB';
@@ -31,6 +31,56 @@ describe('UserModel', () => {
     vi.clearAllMocks();
   });
 
+  describe('getUserActivitySummary', () => {
+    it('returns the user creation time and latest user-authored message', async () => {
+      const userCreatedAt = new Date('2026-01-01T00:00:00.000Z');
+      const latestUserMessageAt = new Date('2026-03-01T00:00:00.000Z');
+      await serverDB.update(users).set({ createdAt: userCreatedAt }).where(eq(users.id, userId));
+      await serverDB.insert(messages).values([
+        {
+          content: 'older',
+          createdAt: new Date('2026-02-01T00:00:00.000Z'),
+          id: 'activity-user-old',
+          role: 'user',
+          userId,
+        },
+        {
+          content: 'ignored assistant',
+          createdAt: new Date('2026-04-01T00:00:00.000Z'),
+          id: 'activity-assistant',
+          role: 'assistant',
+          userId,
+        },
+        {
+          content: 'latest',
+          createdAt: latestUserMessageAt,
+          id: 'activity-user-latest',
+          role: 'user',
+          userId,
+        },
+        {
+          content: 'other user',
+          createdAt: new Date('2026-05-01T00:00:00.000Z'),
+          id: 'activity-other-user',
+          role: 'user',
+          userId: otherUserId,
+        },
+      ]);
+
+      await expect(userModel.getUserActivitySummary()).resolves.toEqual({
+        lastUserMessageAt: latestUserMessageAt,
+        userCreatedAt,
+      });
+    });
+
+    it('returns a null message time when the user has never sent a message', async () => {
+      const result = await userModel.getUserActivitySummary();
+
+      expect(result.lastUserMessageAt).toBeNull();
+      expect(result.userCreatedAt).toBeInstanceOf(Date);
+    });
+  });
+
   describe('getUserRegistrationDuration', () => {
     it('should return registration duration for existing user', async () => {
       const thirtyDaysAgo = new Date();
@@ -60,6 +110,7 @@ describe('UserModel', () => {
       await serverDB.insert(userSettings).values({
         id: userId,
         general: { fontSize: 14 },
+        notification: { inbox: { enabled: false } },
         tts: { voice: 'default' },
       });
 
@@ -70,6 +121,7 @@ describe('UserModel', () => {
       expect(result.fullName).toBe('Test User');
       expect(result.settings.general).toEqual({ fontSize: 14 });
       expect(result.settings.tts).toEqual({ voice: 'default' });
+      expect(result.settings.notification).toEqual({ inbox: { enabled: false } });
     });
 
     it('should throw UserNotFoundError for non-existent user', async () => {
@@ -198,6 +250,52 @@ describe('UserModel', () => {
       });
 
       expect(updated?.username).toBe('myuser');
+    });
+  });
+
+  describe('advanceLastActiveAt', () => {
+    it('should advance lastActiveAt and return the previous activity state', async () => {
+      const previousLastActiveAt = new Date('2026-03-01T00:00:00.000Z');
+      const currentTime = new Date('2026-05-01T00:00:00.000Z');
+
+      await serverDB
+        .update(users)
+        .set({ lastActiveAt: previousLastActiveAt })
+        .where(eq(users.id, userId));
+
+      await expect(userModel.advanceLastActiveAt(currentTime)).resolves.toMatchObject({
+        previousLastActiveAt,
+      });
+
+      const updated = await serverDB.query.users.findFirst({
+        where: eq(users.id, userId),
+      });
+
+      expect(updated?.lastActiveAt.getTime()).toBe(currentTime.getTime());
+    });
+
+    it('should advance lastActiveAt when the previous DB value has microsecond precision', async () => {
+      const currentTime = new Date('2026-05-01T00:00:00.000Z');
+
+      await serverDB.execute(sql`
+        UPDATE ${users}
+        SET last_active_at = '2026-03-01T00:00:00.123456Z'::timestamptz
+        WHERE id = ${userId}
+      `);
+
+      const user = await UserModel.findById(serverDB, userId);
+
+      expect(user?.lastActiveAt.getTime()).toBe(new Date('2026-03-01T00:00:00.123Z').getTime());
+
+      await expect(userModel.advanceLastActiveAt(currentTime)).resolves.toMatchObject({
+        previousLastActiveAt: new Date('2026-03-01T00:00:00.123Z'),
+      });
+
+      const updated = await serverDB.query.users.findFirst({
+        where: eq(users.id, userId),
+      });
+
+      expect(updated?.lastActiveAt.getTime()).toBe(currentTime.getTime());
     });
   });
 
@@ -458,6 +556,44 @@ describe('UserModel', () => {
         const user = await UserModel.findByEmail(serverDB, 'nonexistent@example.com');
 
         expect(user).toBeUndefined();
+      });
+    });
+
+    describe('getDisplayInfoByIds', () => {
+      it('should return empty array for empty ids without querying', async () => {
+        const result = await UserModel.getDisplayInfoByIds(serverDB, []);
+        expect(result).toEqual([]);
+      });
+
+      it('should return only display columns (name + avatar), never settings', async () => {
+        await serverDB
+          .update(users)
+          .set({ avatar: 'avatar.png', username: 'tester' })
+          .where(eq(users.id, userId));
+
+        const result = await UserModel.getDisplayInfoByIds(serverDB, [userId, otherUserId]);
+
+        const byId = new Map(result.map((r) => [r.id, r]));
+        expect(byId.get(userId)).toEqual({
+          avatar: 'avatar.png',
+          fullName: 'Test User',
+          id: userId,
+          username: 'tester',
+        });
+        // otherUserId was inserted with only an email — name fields stay null.
+        expect(byId.get(otherUserId)).toEqual({
+          avatar: null,
+          fullName: null,
+          id: otherUserId,
+          username: null,
+        });
+        // The row must not leak email or any non-display column.
+        expect(Object.keys(result[0])).toEqual(['avatar', 'fullName', 'id', 'username']);
+      });
+
+      it('should skip ids that do not exist', async () => {
+        const result = await UserModel.getDisplayInfoByIds(serverDB, [userId, 'ghost']);
+        expect(result.map((r) => r.id)).toEqual([userId]);
       });
     });
 

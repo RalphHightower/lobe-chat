@@ -1,15 +1,13 @@
-import { isDesktop } from '@lobechat/const';
 import { type ChatToolPayload } from '@lobechat/types';
 import debug from 'debug';
-import i18n from 'i18next';
 
 import { type StreamEvent } from '@/services/agentRuntime';
 import { agentRuntimeService } from '@/services/agentRuntime';
-import { getAgentStoreState } from '@/store/agent';
-import { agentSelectors } from '@/store/agent/selectors';
 import { type ChatStore } from '@/store/chat/store';
-import { notifyDesktopHumanApprovalRequired } from '@/store/chat/utils/desktopNotification';
-import { topicMapKey } from '@/store/chat/utils/topicMapKey';
+import {
+  notifyDesktopAgentCompleted,
+  notifyDesktopHumanApprovalRequired,
+} from '@/store/chat/utils/desktopNotification';
 import { type StoreSetter } from '@/store/types';
 
 const log = debug('store:chat:ai-agent:runAgent');
@@ -118,8 +116,18 @@ export class AgentActionImpl {
 
       case 'agent_runtime_end': {
         // Agent runtime finished - this is the definitive signal that generation is complete
-        const { reason, reasonDetail, finalState } = event.data || {};
+        const { reason, reasonDetail, finalState, uiMessages } = event.data || {};
         log(`Agent runtime ended for ${assistantId}: reason=${reason}, detail=${reasonDetail}`);
+
+        // Server pushes the canonical UIChatMessage[] snapshot for the
+        // topic as the Source of Truth on terminal-state. The last step
+        // has no later step_start to carry a fresh snapshot, so without
+        // this branch the streamed assistantGroup would only be reconciled
+        // with DB once a refetch fires — losing the SoT guarantee.
+        if (Array.isArray(uiMessages)) {
+          log(`Replacing messages from agent_runtime_end uiMessages (${uiMessages.length} msgs)`);
+          this.#get().replaceMessages(uiMessages, { context: operation.context });
+        }
 
         // Update operation metadata with final state
         if (finalState) {
@@ -235,48 +243,54 @@ export class AgentActionImpl {
         // Stop loading state
         log(`Stopping loading for ${assistantId}`);
 
-        // Show desktop notification
-        if (isDesktop) {
-          try {
-            const { desktopNotificationService } =
-              await import('@/services/electron/desktopNotification');
-
-            // Use topic title or agent title as notification title
-            let notificationTitle = i18n.t('desktopNotification.aiReplyCompleted.title', {
-              ns: 'chat',
-            });
-            const opCtx = operation.context;
-            if (opCtx.topicId && opCtx.agentId) {
-              const key = topicMapKey({ agentId: opCtx.agentId, groupId: opCtx.groupId });
-              const topicData = this.#get().topicDataMap[key];
-              const topic = topicData?.items?.find((item) => item.id === opCtx.topicId);
-              if (topic?.title) notificationTitle = topic.title;
-            } else if (opCtx.agentId) {
-              const agentMeta = agentSelectors.getAgentMetaById(opCtx.agentId)(
-                getAgentStoreState(),
-              );
-              if (agentMeta?.title) notificationTitle = agentMeta.title;
-            }
-
-            await desktopNotificationService.showNotification({
-              body: i18n.t('desktopNotification.aiReplyCompleted.body', { ns: 'chat' }),
-              title: notificationTitle,
-            });
-          } catch (error) {
-            console.error('Desktop notification error:', error);
-          }
-        }
+        // Show desktop notification — unified completion notification: title =
+        // topic/agent name, body = the actual reply, click deep-links to the
+        // conversation. The helper no-ops off-desktop and resolves title/body
+        // from the operation context + final content.
+        await notifyDesktopAgentCompleted(this.#get, {
+          content: finalContent,
+          context: operation.context,
+        });
 
         // Mark unread completion for background agents
         const op = this.#get().operations[operationId];
         if (op?.context.agentId) {
-          this.#get().markUnreadCompleted(op.context.agentId, op.context.topicId);
+          this.#get().markTopicUnread({
+            agentId: op.context.agentId,
+            groupId: op.context.groupId,
+            topicId: op.context.topicId,
+          });
+        }
+        break;
+      }
+
+      case 'visible_output_end': {
+        // Example: no-tool answers can finish visible text several seconds
+        // before agent_runtime_end reconciles cache, queue, unread, and
+        // notification side effects. Retire only visible loading here.
+        this.#get().updateOperationMetadata(operationId, { visibleLoadingDone: true });
+        if (operation.parentOperationId) {
+          this.#get().updateOperationMetadata(operation.parentOperationId, {
+            visibleLoadingDone: true,
+          });
         }
         break;
       }
 
       case 'step_start': {
-        const { phase, toolCall, pendingToolsCalling, requiresApproval } = event.data || {};
+        const { phase, toolCall, pendingToolsCalling, requiresApproval, uiMessages } =
+          event.data || {};
+
+        // Server attaches the canonical UIChatMessage[] snapshot to
+        // step_start so the client uses the pushed payload as Source of
+        // Truth instead of refetching from DB (the DB fan-out from the
+        // previous step's stream chunks is async — a refetch here would
+        // return a stale assistant placeholder that clobbers the
+        // streamed assistantGroup).
+        if (Array.isArray(uiMessages)) {
+          log(`Replacing messages from step_start uiMessages (${uiMessages.length} msgs)`);
+          this.#get().replaceMessages(uiMessages, { context: operation.context });
+        }
 
         if (phase === 'human_approval' && requiresApproval) {
           // Requires human approval
@@ -287,6 +301,20 @@ export class AgentActionImpl {
           });
 
           await notifyDesktopHumanApprovalRequired(this.#get, operation.context);
+          if (operation.context.topicId) {
+            const statusWrite = this.#get().updateTopicStatus?.({
+              agentId: operation.context.agentId,
+              groupId: operation.context.groupId,
+              ...(operation.context.scope === 'group' || operation.context.scope === 'group_agent'
+                ? { scope: operation.context.scope }
+                : {}),
+              status: 'waitingForHuman',
+              topicId: operation.context.topicId,
+            });
+            void statusWrite?.catch((error) => {
+              console.error('[runAgent] updateTopicStatus failed:', error);
+            });
+          }
 
           // Stop loading state, waiting for human intervention
           log(`Stopping loading for human approval: ${assistantId}`);
@@ -301,8 +329,10 @@ export class AgentActionImpl {
 
         if (phase === 'tool_execution' && result) {
           log(`Tool execution completed for ${assistantId} in ${executionTime}ms:`, result);
-          // Refresh messages to display tool results
-          await this.#get().refreshMessages();
+          // Tool results are reconciled via the canonical uiMessages
+          // snapshot the server pushes on the next step_start; no need
+          // to refetch from DB here (the refetch was the source of the
+          // assistantGroup-clobber regression.
         } else if (phase === 'execution_complete' && finalState) {
           // Agent execution complete
           log(`Agent execution completed for ${assistantId}:`, finalState);

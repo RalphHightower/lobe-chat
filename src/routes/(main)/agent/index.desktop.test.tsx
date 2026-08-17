@@ -3,7 +3,7 @@
  */
 import { act, render, screen } from '@testing-library/react';
 import type { ReactNode } from 'react';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { initialState as initialChatState } from '@/store/chat/initialState';
@@ -62,12 +62,8 @@ vi.mock('./features/Conversation', () => ({
   default: () => <div data-testid="conversation" />,
 }));
 
-vi.mock('./features/Conversation/WorkingSidebar', () => ({
+vi.mock('@/features/Conversation/WorkingSidebar', () => ({
   default: () => <div data-testid="working-sidebar" />,
-}));
-
-vi.mock('./features/PageTitle', () => ({
-  default: () => <div data-testid="page-title" />,
 }));
 
 vi.mock('./features/Portal', () => ({
